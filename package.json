@@ -1,6 +1,7 @@
 {
   "name": "tutor",
   "version": "1.0.0",
+  "packageManager": "pnpm@11.6.0",
   "main": "index.js",
   "dependencies": {
     "@expo/metro-runtime": "~56.0.15",
