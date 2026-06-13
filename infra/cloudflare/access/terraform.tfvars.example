@@ -1,0 +1,6 @@
+cloudflare_account_id = "replace-with-cloudflare-account-id"
+
+family_email_allowlist = [
+  "parent@example.com",
+  "student@example.com",
+]
