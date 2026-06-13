@@ -1,0 +1,3 @@
+OPENAI_API_KEY=sk-proj-replace-me
+CLOUDFLARE_ACCESS_AUD=replace-with-access-aud-tag
+OPENAI_SAFETY_IDENTIFIER_SALT=replace-with-random-secret
