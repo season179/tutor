@@ -5,6 +5,15 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow tutor to use the camera to capture a temporary photo.",
+          "recordAudioAndroid": false
+        }
+      ]
+    ],
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true
