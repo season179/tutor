@@ -4,6 +4,13 @@ export type TutorTranscriptEntry = {
   id: string;
   role: 'student' | 'assistant' | 'system';
   text: string;
+  image?: {
+    uri: string;
+    width: number;
+    height: number;
+    contentType: string;
+    byteLength: number;
+  };
 };
 
 export type TutorRealtimeSession = {
@@ -21,6 +28,9 @@ export type StartTutorRealtimeSessionInput = {
   photoContentType: string;
   photoWidth: number;
   photoHeight: number;
+  initialQuestionText?: string;
+  sourcePhotoR2Key?: string;
+  sourceSessionId?: string;
   onStatus: (status: string) => void;
   onTranscript: (entry: TutorTranscriptEntry) => void;
   onAssistantDelta: (delta: string) => void;

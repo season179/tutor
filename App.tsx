@@ -1,11 +1,13 @@
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { File } from 'expo-file-system';
+import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
 import * as ImagePicker from 'expo-image-picker';
 import { StatusBar } from 'expo-status-bar';
 import {
   ArrowLeft,
   Camera,
   Check,
+  FileText,
   ImagePlus,
   LogOut,
   Mic,
@@ -33,10 +35,16 @@ import {
   type TutorRealtimeSession,
   type TutorTranscriptEntry,
 } from './src/realtimeTutor';
-import { extractAccessCookie, type TutorAccess } from './src/tutorBackend';
+import {
+  appendTutorEvents,
+  extractAccessCookie,
+  extractQuestionFromPhoto,
+  type TutorAccess,
+  type TutorQuestionExtraction,
+} from './src/tutorBackend';
 import { runNativeWebRTCSmokeTest } from './src/webrtcSmoke';
 
-type Screen = 'source' | 'camera' | 'preview' | 'auth' | 'tutor';
+type Screen = 'source' | 'camera' | 'preview' | 'auth' | 'review' | 'tutor';
 type CapturedPhoto = {
   uri: string;
   width: number;
@@ -53,6 +61,10 @@ const ACCESS_COOKIE_SCRIPT = `
   }));
   true;
 `;
+
+const QUESTION_EXTRACTION_IMAGE_CONTENT_TYPE = 'image/jpeg';
+const QUESTION_EXTRACTION_IMAGE_MAX_EDGE = 2400;
+const QUESTION_EXTRACTION_IMAGE_COMPRESSION = 0.9;
 
 function deleteTemporaryPhoto(photo?: CapturedPhoto | null) {
   if (!photo?.deleteAfterUse || Platform.OS === 'web' || photo.uri.startsWith('data:')) {
@@ -90,6 +102,53 @@ function photoContentType(photo: CapturedPhoto): string {
   return photo.contentType || contentTypeFromUri(photo.uri);
 }
 
+async function prepareQuestionExtractionPhoto(photo: CapturedPhoto): Promise<CapturedPhoto> {
+  const context = ImageManipulator.manipulate(photo.uri);
+  const resize = imageResize(photo.width, photo.height, QUESTION_EXTRACTION_IMAGE_MAX_EDGE);
+  if (resize.width || resize.height) {
+    context.resize(resize);
+  }
+
+  const rendered = await context.renderAsync();
+  const result = await rendered.saveAsync({
+    compress: QUESTION_EXTRACTION_IMAGE_COMPRESSION,
+    format: SaveFormat.JPEG,
+  });
+
+  return {
+    uri: result.uri,
+    width: result.width,
+    height: result.height,
+    contentType: QUESTION_EXTRACTION_IMAGE_CONTENT_TYPE,
+    deleteAfterUse: true,
+  };
+}
+
+function imageResize(width: number, height: number, maxEdge: number): { width?: number; height?: number } {
+  if (!width || !height) {
+    return { width: maxEdge };
+  }
+
+  const currentMaxEdge = Math.max(width, height);
+  if (currentMaxEdge <= maxEdge) {
+    return {};
+  }
+
+  return width >= height ? { width: maxEdge } : { height: maxEdge };
+}
+
+function transcriptRoleLabel(role: TutorTranscriptEntry['role']): string {
+  if (role === 'assistant') {
+    return 'Tutor';
+  }
+
+  if (role === 'system') {
+    return 'System';
+  }
+
+  return 'Student';
+}
+
 function messageFromError(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong.';
 }
@@ -104,6 +163,8 @@ export default function App() {
   const [photo, setPhoto] = useState<CapturedPhoto | null>(null);
   const [access, setAccess] = useState<TutorAccess | null>(null);
   const [tutorSession, setTutorSession] = useState<TutorRealtimeSession | null>(null);
+  const [questionExtraction, setQuestionExtraction] = useState<TutorQuestionExtraction | null>(null);
+  const [validatedQuestionText, setValidatedQuestionText] = useState('');
   const [transcript, setTranscript] = useState<TutorTranscriptEntry[]>([]);
   const [assistantDraft, setAssistantDraft] = useState('');
   const [followUpText, setFollowUpText] = useState('');
@@ -116,6 +177,7 @@ export default function App() {
   const [isPickingPhoto, setIsPickingPhoto] = useState(false);
   const [isStartingTutor, setIsStartingTutor] = useState(false);
   const [isEndingTutor, setIsEndingTutor] = useState(false);
+  const [isSavingQuestion, setIsSavingQuestion] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
@@ -205,6 +267,8 @@ export default function App() {
     deleteTemporaryPhoto(photo);
     setPhoto(null);
     setTutorSession(null);
+    setQuestionExtraction(null);
+    setValidatedQuestionText('');
     accessStartRef.current = false;
     setTranscript([]);
     setAssistantDraft('');
@@ -217,6 +281,7 @@ export default function App() {
     setHasCameraPreviewTimedOut(false);
     setIsStartingTutor(false);
     setIsEndingTutor(false);
+    setIsSavingQuestion(false);
     setStatusText('Ready');
     setErrorMessage(null);
     setScreen('source');
@@ -238,6 +303,8 @@ export default function App() {
       });
 
       if (result) {
+        setQuestionExtraction(null);
+        setValidatedQuestionText('');
         setPhoto({
           uri: result.uri,
           width: result.width,
@@ -281,6 +348,8 @@ export default function App() {
 
       const asset = result.assets[0];
       deleteTemporaryPhoto(photo);
+      setQuestionExtraction(null);
+      setValidatedQuestionText('');
       setPhoto({
         uri: asset.uri,
         width: asset.width,
@@ -299,6 +368,8 @@ export default function App() {
   function retakePhoto() {
     deleteTemporaryPhoto(photo);
     setPhoto(null);
+    setQuestionExtraction(null);
+    setValidatedQuestionText('');
     accessStartRef.current = false;
     setErrorMessage(null);
     setIsCameraReady(false);
@@ -306,10 +377,12 @@ export default function App() {
     setScreen('camera');
   }
 
-  async function startTutorFromPreview(nextAccess = access) {
+  async function startSessionFromPreview(nextAccess = access) {
     if (!photo) {
       return;
     }
+    const currentPhoto = photo;
+    let extractionPhoto: CapturedPhoto | null = null;
 
     if (!nextAccess) {
       setErrorMessage(null);
@@ -322,17 +395,41 @@ export default function App() {
     setTranscript([]);
     setAssistantDraft('');
     setFollowUpText('');
-    setStatusText('Connecting...');
-    setScreen('tutor');
+    setQuestionExtraction(null);
+    setValidatedQuestionText('');
+    setStatusText('Extracting question...');
 
     try {
+      extractionPhoto = await prepareQuestionExtractionPhoto(currentPhoto);
+      const extraction = await extractQuestionFromPhoto({
+        backendUrl: TUTOR_BACKEND_URL,
+        access: nextAccess,
+        photoUri: extractionPhoto.uri,
+        contentType: extractionPhoto.contentType,
+      });
+      setQuestionExtraction(extraction);
+      setValidatedQuestionText(extraction.extractedQuestion);
+
+      if (!extraction.isTutorable || extraction.needsRetake) {
+        const reason = extraction.reason || 'I could not find a tutor-ready question in this photo.';
+        setErrorMessage(`${reason} Please take or choose the photo again.`);
+        setStatusText('Please retake the photo.');
+        setScreen('preview');
+        return;
+      }
+
+      setStatusText('Starting tutor...');
+      setScreen('tutor');
       const session = await startTutorRealtimeSession({
         backendUrl: TUTOR_BACKEND_URL,
         access: nextAccess,
-        photoUri: photo.uri,
-        photoContentType: photoContentType(photo),
-        photoWidth: photo.width,
-        photoHeight: photo.height,
+        photoUri: currentPhoto.uri,
+        photoContentType: photoContentType(currentPhoto),
+        photoWidth: currentPhoto.width,
+        photoHeight: currentPhoto.height,
+        initialQuestionText: extraction.extractedQuestion,
+        sourcePhotoR2Key: extraction.photo.r2Key,
+        sourceSessionId: extraction.sessionId,
         onStatus: setStatusText,
         onTranscript: appendTranscript,
         onAssistantDelta: (delta) => {
@@ -344,14 +441,14 @@ export default function App() {
         },
       });
       setTutorSession(session);
-      deleteTemporaryPhoto(photo);
+      deleteTemporaryPhoto(currentPhoto);
       setPhoto(null);
-      setStatusText('Listening...');
     } catch (error) {
       setErrorMessage(messageFromError(error));
-      setStatusText('Could not start tutor.');
+      setStatusText('Could not start session.');
       setScreen('preview');
     } finally {
+      deleteTemporaryPhoto(extractionPhoto);
       setIsStartingTutor(false);
     }
   }
@@ -375,7 +472,7 @@ export default function App() {
     accessStartRef.current = true;
     setAccess(nextAccess);
     setStatusText('Signed in.');
-    void startTutorFromPreview(nextAccess);
+    void startSessionFromPreview(nextAccess);
   }
 
   function sendFollowUpText() {
@@ -398,6 +495,44 @@ export default function App() {
     tutorSession.setMuted(nextMuted);
     setIsMuted(nextMuted);
     setStatusText(nextMuted ? 'Microphone muted.' : 'Listening...');
+  }
+
+  async function saveValidatedQuestion() {
+    const text = validatedQuestionText.trim();
+    if (!questionExtraction || !access || !text || isSavingQuestion) {
+      return;
+    }
+
+    setIsSavingQuestion(true);
+    setErrorMessage(null);
+
+    try {
+      await appendTutorEvents({
+        backendUrl: TUTOR_BACKEND_URL,
+        access,
+        sessionId: questionExtraction.sessionId,
+        events: [
+          {
+            eventType: 'question_text_validated',
+            role: 'student',
+            modality: 'text',
+            content: text,
+            metadata: {
+              source: 'manual_review',
+              modelId: questionExtraction.modelId,
+              openAiRequestId: questionExtraction.openAiRequestId,
+            },
+            clientCreatedAt: new Date().toISOString(),
+          },
+        ],
+      });
+      setStatusText('Validated question saved.');
+    } catch (error) {
+      setErrorMessage(messageFromError(error));
+      setStatusText('Could not save validation.');
+    } finally {
+      setIsSavingQuestion(false);
+    }
   }
 
   async function endTutorSession(status: 'ended' | 'failed' | 'cancelled' = 'ended') {
@@ -532,11 +667,11 @@ export default function App() {
           <Text style={styles.authTitle}>Sign in</Text>
         </View>
         <Text style={styles.authText}>
-          Use your Cloudflare Access email PIN. The tutor will start after sign-in.
+          Use your Cloudflare Access email PIN. Question extraction will start after sign-in.
         </Text>
         {Platform.OS === 'web' ? (
           <View style={styles.authFallback}>
-            <Text style={styles.authText}>Realtime voice tutoring requires a native dev build.</Text>
+            <Text style={styles.authText}>Question extraction requires a native dev build.</Text>
           </View>
         ) : (
           <WebView
@@ -570,7 +705,7 @@ export default function App() {
           </Pressable>
           <Pressable
             disabled={isStartingTutor}
-            onPress={() => void startTutorFromPreview()}
+            onPress={() => void startSessionFromPreview()}
             style={[styles.primaryButton, isStartingTutor && styles.disabledButton]}
           >
             {isStartingTutor ? (
@@ -578,7 +713,79 @@ export default function App() {
             ) : (
               <Check color="#ffffff" size={20} strokeWidth={2.4} />
             )}
-            <Text style={styles.primaryButtonText}>Start tutor</Text>
+            <Text style={styles.primaryButtonText}>Start session</Text>
+          </Pressable>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (screen === 'review' && photo && questionExtraction) {
+    return (
+      <SafeAreaView style={styles.reviewScreen}>
+        <StatusBar style="dark" />
+        <View style={styles.reviewHeader}>
+          <Pressable
+            accessibilityLabel="Back"
+            hitSlop={12}
+            onPress={() => setScreen('preview')}
+            style={styles.lightIconButton}
+          >
+            <ArrowLeft color="#111827" size={25} strokeWidth={2.3} />
+          </Pressable>
+          <View style={styles.reviewTitleBlock}>
+            <Text style={styles.reviewTitle}>Review question</Text>
+            <Text style={styles.reviewStatus}>{statusText}</Text>
+          </View>
+        </View>
+
+        <ScrollView contentContainerStyle={styles.reviewContent}>
+          <Image resizeMode="contain" source={{ uri: photo.uri }} style={styles.reviewImage} />
+
+          <View style={styles.reviewMetaRow}>
+            <FileText color="#111827" size={18} strokeWidth={2.3} />
+            <Text style={styles.reviewMetaText}>
+              {questionExtraction.modelId} - {questionExtraction.sessionId.slice(0, 8)}
+            </Text>
+          </View>
+
+          <Text style={styles.reviewLabel}>Extracted question</Text>
+          <TextInput
+            multiline
+            onChangeText={setValidatedQuestionText}
+            placeholder="Extracted question text"
+            placeholderTextColor="#6b7280"
+            style={styles.reviewQuestionInput}
+            textAlignVertical="top"
+            value={validatedQuestionText}
+          />
+
+          {errorMessage ? <Text style={styles.reviewErrorText}>{errorMessage}</Text> : null}
+        </ScrollView>
+
+        <View style={styles.reviewActions}>
+          <Pressable
+            disabled={isSavingQuestion}
+            onPress={retakePhoto}
+            style={[styles.secondaryButton, isSavingQuestion && styles.disabledButton]}
+          >
+            <RotateCcw color="#111827" size={19} strokeWidth={2.2} />
+            <Text style={styles.secondaryButtonText}>Retake</Text>
+          </Pressable>
+          <Pressable
+            disabled={isSavingQuestion || !validatedQuestionText.trim()}
+            onPress={() => void saveValidatedQuestion()}
+            style={[
+              styles.primaryButton,
+              (isSavingQuestion || !validatedQuestionText.trim()) && styles.disabledButton,
+            ]}
+          >
+            {isSavingQuestion ? (
+              <ActivityIndicator color="#ffffff" />
+            ) : (
+              <Check color="#ffffff" size={20} strokeWidth={2.4} />
+            )}
+            <Text style={styles.primaryButtonText}>Save validation</Text>
           </Pressable>
         </View>
       </SafeAreaView>
@@ -615,16 +822,26 @@ export default function App() {
             <View style={styles.emptyTranscript}>
               <ActivityIndicator color="#111827" />
               <Text style={styles.emptyTranscriptText}>
-                Starting voice tutoring from the photo...
+                Starting voice tutoring from the extracted question...
               </Text>
             </View>
           ) : null}
           {transcript.map((entry) => (
             <View key={entry.id} style={styles.transcriptLine}>
               <Text style={styles.transcriptRole}>
-                {entry.role === 'assistant' ? 'Tutor' : 'Student'}
+                {transcriptRoleLabel(entry.role)}
               </Text>
               <Text style={styles.transcriptText}>{entry.text}</Text>
+              {entry.image ? (
+                <Image
+                  resizeMode="contain"
+                  source={{ uri: entry.image.uri }}
+                  style={[
+                    styles.transcriptImage,
+                    { aspectRatio: entry.image.width / entry.image.height },
+                  ]}
+                />
+              ) : null}
             </View>
           ))}
           {assistantDraft ? (
@@ -886,6 +1103,91 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
   },
+  reviewScreen: {
+    backgroundColor: '#f9fafb',
+    flex: 1,
+  },
+  reviewHeader: {
+    alignItems: 'center',
+    borderBottomColor: '#e5e7eb',
+    borderBottomWidth: 1,
+    flexDirection: 'row',
+    gap: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+  },
+  reviewTitleBlock: {
+    flex: 1,
+  },
+  reviewTitle: {
+    color: '#111827',
+    fontSize: 22,
+    fontWeight: '800',
+  },
+  reviewStatus: {
+    color: '#4b5563',
+    fontSize: 14,
+    marginTop: 2,
+  },
+  reviewContent: {
+    gap: 14,
+    padding: 18,
+    paddingBottom: 108,
+  },
+  reviewImage: {
+    alignSelf: 'center',
+    backgroundColor: '#000000',
+    borderRadius: 8,
+    height: 260,
+    width: '100%',
+  },
+  reviewMetaRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+  },
+  reviewMetaText: {
+    color: '#374151',
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  reviewLabel: {
+    color: '#6b7280',
+    fontSize: 12,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+  },
+  reviewQuestionInput: {
+    backgroundColor: '#ffffff',
+    borderColor: '#d1d5db',
+    borderRadius: 8,
+    borderWidth: 1,
+    color: '#111827',
+    fontSize: 18,
+    lineHeight: 26,
+    minHeight: 220,
+    padding: 14,
+  },
+  reviewErrorText: {
+    color: '#b91c1c',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  reviewActions: {
+    alignItems: 'center',
+    backgroundColor: '#f9fafb',
+    borderTopColor: '#e5e7eb',
+    borderTopWidth: 1,
+    bottom: 0,
+    flexDirection: 'row',
+    gap: 14,
+    justifyContent: 'center',
+    left: 0,
+    padding: 14,
+    position: 'absolute',
+    right: 0,
+  },
   authScreen: {
     backgroundColor: '#ffffff',
     flex: 1,
@@ -987,6 +1289,15 @@ const styles = StyleSheet.create({
     color: '#111827',
     fontSize: 17,
     lineHeight: 24,
+  },
+  transcriptImage: {
+    backgroundColor: '#f9fafb',
+    borderColor: '#d1d5db',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 6,
+    maxHeight: 420,
+    width: '100%',
   },
   tutorErrorText: {
     color: '#b91c1c',

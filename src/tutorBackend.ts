@@ -14,6 +14,25 @@ export type TutorBackendSession = {
   openAiRequestId: string | null;
 };
 
+export type TutorQuestionExtraction = {
+  extractedQuestion: string;
+  isTutorable: boolean;
+  confidence: number;
+  reason: string;
+  needsRetake: boolean;
+  blockers: string[];
+  modelId: string;
+  openAiRequestId: string | null;
+  photo: {
+    r2Key: string;
+    contentType: string;
+    sizeBytes: number;
+    sha256Hex: string;
+    uploadedAt: string;
+  };
+  sessionId: string;
+};
+
 export class TutorBackendError extends Error {
   constructor(
     message: string,
@@ -94,6 +113,62 @@ export async function uploadSessionPhoto(params: {
   }
 
   return { r2Key };
+}
+
+export async function extractQuestionFromPhoto(params: {
+  backendUrl: string;
+  access: TutorAccess;
+  photoUri: string;
+  contentType: string;
+}): Promise<TutorQuestionExtraction> {
+  const file = new File(params.photoUri);
+  const result = await file.upload(`${params.backendUrl}/question-extractions`, {
+    httpMethod: 'POST',
+    uploadType: UploadType.BINARY_CONTENT,
+    mimeType: params.contentType,
+    headers: {
+      'Content-Type': params.contentType,
+      Cookie: params.access.cookieHeader,
+      'X-Tutor-Photo-Filename': file.name || 'question-photo.jpg',
+    },
+  });
+
+  if (result.status < 200 || result.status >= 300) {
+    throw new TutorBackendError(uploadErrorMessage(result), result.status);
+  }
+
+  const body = safeParseJson(result.body) as Partial<TutorQuestionExtraction> | null;
+  if (
+    !body ||
+    typeof body.sessionId !== 'string' ||
+    typeof body.extractedQuestion !== 'string' ||
+    typeof body.modelId !== 'string' ||
+    !body.photo ||
+    typeof body.photo.r2Key !== 'string'
+  ) {
+    throw new TutorBackendError('Backend did not return extracted question text.');
+  }
+
+  return {
+    extractedQuestion: body.extractedQuestion,
+    isTutorable: body.isTutorable === true,
+    confidence: typeof body.confidence === 'number' ? body.confidence : 0,
+    reason: typeof body.reason === 'string' ? body.reason : '',
+    needsRetake: body.needsRetake === true,
+    blockers: Array.isArray(body.blockers)
+      ? body.blockers.filter((blocker): blocker is string => typeof blocker === 'string')
+      : [],
+    modelId: body.modelId,
+    openAiRequestId: typeof body.openAiRequestId === 'string' ? body.openAiRequestId : null,
+    photo: {
+      r2Key: body.photo.r2Key,
+      contentType: typeof body.photo.contentType === 'string' ? body.photo.contentType : params.contentType,
+      sizeBytes: typeof body.photo.sizeBytes === 'number' ? body.photo.sizeBytes : 0,
+      sha256Hex: typeof body.photo.sha256Hex === 'string' ? body.photo.sha256Hex : '',
+      uploadedAt: typeof body.photo.uploadedAt === 'string' ? body.photo.uploadedAt : '',
+    },
+    sessionId: body.sessionId,
+  };
 }
 
 export async function appendTutorEvents(params: {

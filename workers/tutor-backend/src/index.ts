@@ -1,7 +1,9 @@
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 
 const OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const DEFAULT_MODEL = "gpt-realtime-2";
+const DEFAULT_QUESTION_EXTRACTION_MODEL = "gpt-5.4-nano";
 const DEFAULT_VOICE = "marin";
 const SERVICE_NAME = "tutor-backend";
 const MAX_SDP_LENGTH = 256_000;
@@ -16,6 +18,7 @@ type SecretEnv = {
   OPENAI_API_KEY?: string;
   CLOUDFLARE_ACCESS_AUD?: string;
   OPENAI_SAFETY_IDENTIFIER_SALT?: string;
+  OPENAI_QUESTION_EXTRACTION_MODEL?: string;
 };
 
 type TutorEnv = Env & SecretEnv;
@@ -71,6 +74,16 @@ type PhotoMetadata = {
   uploadedAt: string;
 };
 
+type QuestionExtractionResult = {
+  extractedQuestion: string;
+  isTutorable: boolean;
+  confidence: number;
+  reason: string;
+  needsRetake: boolean;
+  blockers: string[];
+  openAiRequestId: string | null;
+};
+
 const TUTOR_INSTRUCTIONS = `# Role and Objective
 You are a gentle, patient tutor helping a child solve a photographed school question.
 
@@ -83,6 +96,7 @@ You are a gentle, patient tutor helping a child solve a photographed school ques
 
 # Language
 - Match the language used in the photo when it is clear.
+- Chinese and Mandarin text are in scope. If the photo contains Chinese characters, try to read them directly.
 - Also listen to the language the child uses when speaking or typing, and respond in that language.
 - If the photo language and the child's language differ, prefer the child's language while preserving exact question text when needed.
 - If the language is ambiguous, use simple English first and ask which language the child prefers.
@@ -113,6 +127,7 @@ You are a gentle, patient tutor helping a child solve a photographed school ques
 # Boundaries
 - Do not shame, scold, or rush the student.
 - Do not claim you can see an image unless image context has actually been provided in the conversation.
+- Do not say you cannot read Chinese or Mandarin. Say only that the photo/text is unclear if the image quality prevents reading it.
 - If the question is unclear, ask the student to retake the photo or read the missing part aloud.
 
 # Reasoning
@@ -124,6 +139,17 @@ You are a gentle, patient tutor helping a child solve a photographed school ques
 - Speak naturally and kindly.
 - Keep responses concise enough for a slow voice conversation.
 - Provide text output that matches the spoken guidance.`;
+
+const QUESTION_EXTRACTION_PROMPT = `Extract the printed school question from this image and decide whether it is ready for a child tutor to help with.
+
+Rules:
+- Preserve the original language, numbers, currency symbols, units, names, punctuation, and answer blanks.
+- Ignore handwritten working and handwritten answers unless they are clearly correcting the printed question.
+- Include the final answer sentence or blank if it is printed as part of the exercise.
+- Mark is_tutorable true only when there is a readable school question or exercise with enough information for a tutor to guide the child.
+- Mark is_tutorable false when the image is too blurry, incomplete, not a school question, missing key numbers/text, or otherwise not useful for tutoring.
+- Set needs_retake true when the user should take/select another photo.
+- Keep reason short and user-facing.`;
 
 export default {
   async fetch(request, env): Promise<Response> {
@@ -142,6 +168,8 @@ export default {
           ok: true,
           service: SERVICE_NAME,
           realtimeModel: env.OPENAI_REALTIME_MODEL || DEFAULT_MODEL,
+          questionExtractionModel:
+            env.OPENAI_QUESTION_EXTRACTION_MODEL || DEFAULT_QUESTION_EXTRACTION_MODEL,
         },
         { headers: corsHeaders(request, env) },
       );
@@ -164,6 +192,8 @@ export default {
           r2Configured: Boolean(env.TUTOR_PHOTOS),
           realtimeModel: env.OPENAI_REALTIME_MODEL || DEFAULT_MODEL,
           realtimeVoice: env.OPENAI_REALTIME_VOICE || DEFAULT_VOICE,
+          questionExtractionModel:
+            env.OPENAI_QUESTION_EXTRACTION_MODEL || DEFAULT_QUESTION_EXTRACTION_MODEL,
         },
         { headers: corsHeaders(request, env) },
       );
@@ -171,6 +201,10 @@ export default {
 
     if (url.pathname === "/session" && request.method === "POST") {
       return withCors(await createRealtimeSession(request, env), request, env);
+    }
+
+    if (url.pathname === "/question-extractions" && request.method === "POST") {
+      return withCors(await createQuestionExtraction(request, env), request, env);
     }
 
     if (url.pathname === "/sessions/recent" && request.method === "GET") {
@@ -407,44 +441,10 @@ async function appendSessionEvents(
     return inputs;
   }
 
-  const nextSequence = await getNextEventSequence(env.TUTOR_DB, sessionId);
-  const records: SessionEventRecord[] = [];
-
-  for (const [index, input] of inputs.entries()) {
-    const record = normalizeEventInput(input, sessionId, nextSequence + index);
-    if (record instanceof Response) {
-      return record;
-    }
-    records.push(record);
+  const records = await persistSessionEvents(env.TUTOR_DB, sessionId, inputs);
+  if (records instanceof Response) {
+    return records;
   }
-
-  await env.TUTOR_DB.batch(
-    records.map((record) =>
-      env.TUTOR_DB.prepare(
-        `INSERT INTO tutor_session_events (
-          id,
-          session_id,
-          sequence,
-          event_type,
-          role,
-          modality,
-          content,
-          metadata_json,
-          client_created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(
-        record.id,
-        record.sessionId,
-        record.sequence,
-        record.eventType,
-        record.role,
-        record.modality,
-        record.content,
-        record.metadataJson,
-        record.clientCreatedAt,
-      ),
-    ),
-  );
 
   await touchSession(env.TUTOR_DB, sessionId);
 
@@ -453,6 +453,353 @@ async function appendSessionEvents(
     sessionId,
     stored: records.length,
   });
+}
+
+async function createQuestionExtraction(request: Request, env: TutorEnv): Promise<Response> {
+  const accessContext = await requireAccessContext(request, env);
+  if (accessContext instanceof Response) {
+    return accessContext;
+  }
+
+  const openAiApiKey = requiredSecret(env.OPENAI_API_KEY);
+  if (!openAiApiKey) {
+    return configurationError("OPENAI_API_KEY is not configured.");
+  }
+
+  const bucket = requiredPhotoBucket(env);
+  if (bucket instanceof Response) {
+    return bucket;
+  }
+
+  const contentType = normalizeImageContentType(request.headers.get("content-type"));
+  if (!contentType) {
+    return jsonResponse(
+      {
+        error: "unsupported_media_type",
+        message: "Upload a JPEG, PNG, WebP, HEIC, or HEIF image.",
+      },
+      { status: 415 },
+    );
+  }
+
+  const declaredLength = parseContentLength(request.headers.get("content-length"));
+  if (declaredLength > MAX_PHOTO_BYTES) {
+    return photoTooLarge();
+  }
+
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength === 0) {
+    return jsonResponse(
+      {
+        error: "empty_photo",
+        message: "Photo upload body cannot be empty.",
+      },
+      { status: 400 },
+    );
+  }
+
+  if (bytes.byteLength > MAX_PHOTO_BYTES) {
+    return photoTooLarge();
+  }
+
+  const originalFilename = parseOptionalHeader(
+    request.headers.get("x-tutor-photo-filename"),
+    200,
+  );
+  if (originalFilename instanceof Response) {
+    return originalFilename;
+  }
+
+  const sessionId = crypto.randomUUID();
+  const startedAt = nowIso();
+  const modelId = env.OPENAI_QUESTION_EXTRACTION_MODEL || DEFAULT_QUESTION_EXTRACTION_MODEL;
+
+  await createSessionRow(env.TUTOR_DB, {
+    id: sessionId,
+    userId: accessContext.userId,
+    startedAt,
+    status: "starting",
+    modelId,
+    photoR2Key: null,
+  });
+
+  const photo = await storeSessionPhoto({
+    bucket,
+    db: env.TUTOR_DB,
+    bytes,
+    contentType,
+    originalFilename,
+    sessionId,
+    userId: accessContext.userId,
+  });
+  if (photo instanceof Response) {
+    await markSessionFailed(env.TUTOR_DB, sessionId, "Question photo storage failed.", null);
+    return photo;
+  }
+
+  const extraction = await extractQuestionText({
+    apiKey: openAiApiKey,
+    bytes,
+    contentType,
+    modelId,
+    userId: accessContext.userId,
+  });
+  if (extraction instanceof Response) {
+    await markSessionFailed(
+      env.TUTOR_DB,
+      sessionId,
+      "Question text extraction failed.",
+      extraction.headers.get("x-openai-request-id"),
+    );
+    return extraction;
+  }
+
+  const storedEvents = await persistSessionEvents(env.TUTOR_DB, sessionId, [
+    {
+      eventType: "question_photo_sent",
+      role: "student",
+      modality: "image",
+      content: photo.r2Key,
+      metadata: {
+        r2Key: photo.r2Key,
+        contentType: photo.contentType,
+        sizeBytes: photo.sizeBytes,
+        sha256Hex: photo.sha256Hex,
+      },
+      clientCreatedAt: startedAt,
+    },
+    {
+      eventType: "question_text_extracted",
+      role: "tool",
+      modality: "text",
+      content: extraction.extractedQuestion,
+      metadata: {
+        modelId,
+        openAiRequestId: extraction.openAiRequestId,
+        isTutorable: extraction.isTutorable,
+        confidence: extraction.confidence,
+        reason: extraction.reason,
+        needsRetake: extraction.needsRetake,
+        blockers: extraction.blockers,
+      },
+      clientCreatedAt: nowIso(),
+    },
+  ]);
+  if (storedEvents instanceof Response) {
+    await markSessionFailed(env.TUTOR_DB, sessionId, "Question extraction events could not be stored.", extraction.openAiRequestId);
+    return storedEvents;
+  }
+
+  await markSessionActive(env.TUTOR_DB, sessionId, extraction.openAiRequestId);
+
+  return jsonResponse({
+    ok: true,
+    sessionId,
+    modelId,
+    openAiRequestId: extraction.openAiRequestId,
+    extractedQuestion: extraction.extractedQuestion,
+    isTutorable: extraction.isTutorable,
+    confidence: extraction.confidence,
+    reason: extraction.reason,
+    needsRetake: extraction.needsRetake,
+    blockers: extraction.blockers,
+    photo: {
+      id: photo.id,
+      r2Key: photo.r2Key,
+      contentType: photo.contentType,
+      sizeBytes: photo.sizeBytes,
+      sha256Hex: photo.sha256Hex,
+      uploadedAt: photo.uploadedAt,
+    },
+  });
+}
+
+async function extractQuestionText(input: {
+  apiKey: string;
+  bytes: ArrayBuffer;
+  contentType: string;
+  modelId: string;
+  userId: string;
+}): Promise<QuestionExtractionResult | Response> {
+  let response: Response;
+  try {
+    response = await fetch(OPENAI_RESPONSES_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${input.apiKey}`,
+        "Content-Type": "application/json",
+        "OpenAI-Safety-Identifier": input.userId,
+      },
+      body: JSON.stringify({
+        model: input.modelId,
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: QUESTION_EXTRACTION_PROMPT,
+              },
+              {
+                type: "input_image",
+                image_url: `data:${input.contentType};base64,${arrayBufferToBase64(input.bytes)}`,
+                detail: "high",
+              },
+            ],
+          },
+        ],
+        max_output_tokens: 800,
+        text: {
+          format: {
+            type: "json_schema",
+            name: "question_extraction_decision",
+            strict: true,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                extracted_question: {
+                  type: "string",
+                  description: "The extracted printed school question text, preserving the original language.",
+                },
+                is_tutorable: {
+                  type: "boolean",
+                  description: "True when the extracted text is a school question a child tutor can help with.",
+                },
+                confidence: {
+                  type: "number",
+                  description: "Confidence from 0 to 1.",
+                },
+                reason: {
+                  type: "string",
+                  description: "Short user-facing reason for the decision.",
+                },
+                needs_retake: {
+                  type: "boolean",
+                  description: "True when the user should take/select another photo.",
+                },
+                blockers: {
+                  type: "array",
+                  description: "Short labels for issues preventing tutoring.",
+                  items: {
+                    type: "string",
+                  },
+                },
+              },
+              required: [
+                "extracted_question",
+                "is_tutorable",
+                "confidence",
+                "reason",
+                "needs_retake",
+                "blockers",
+              ],
+            },
+          },
+        },
+      }),
+    });
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        service: SERVICE_NAME,
+        event: "openai_question_extraction_request_error",
+        modelId: input.modelId,
+        message: error instanceof Error ? error.message : "Unknown OpenAI request error",
+      }),
+    );
+
+    return jsonResponse(
+      {
+        error: "question_extraction_failed",
+        message: "Failed to extract the question text.",
+      },
+      { status: 502 },
+    );
+  }
+
+  const requestId = response.headers.get("x-request-id");
+  if (!response.ok) {
+    const errorBody = await readResponseText(response);
+    console.error(
+      JSON.stringify({
+        service: SERVICE_NAME,
+        event: "openai_question_extraction_failed",
+        status: response.status,
+        requestId,
+        modelId: input.modelId,
+        errorBody,
+      }),
+    );
+
+    return jsonResponse(
+      {
+        error: "question_extraction_failed",
+        message: "Failed to extract the question text.",
+        requestId,
+      },
+      {
+        status: 502,
+        headers: requestId ? { "X-OpenAI-Request-Id": requestId } : undefined,
+      },
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        service: SERVICE_NAME,
+        event: "openai_question_extraction_json_error",
+        requestId,
+        modelId: input.modelId,
+        message: error instanceof Error ? error.message : "Unknown OpenAI response parse error",
+      }),
+    );
+
+    return jsonResponse(
+      {
+        error: "question_extraction_failed",
+        message: "Could not read the extracted question text.",
+        requestId,
+      },
+      {
+        status: 502,
+        headers: requestId ? { "X-OpenAI-Request-Id": requestId } : undefined,
+      },
+    );
+  }
+
+  const decision = parseQuestionExtractionDecision(body);
+  if (!decision) {
+    console.error(
+      JSON.stringify({
+        service: SERVICE_NAME,
+        event: "openai_question_extraction_empty",
+        requestId,
+        modelId: input.modelId,
+      }),
+    );
+
+    return jsonResponse(
+      {
+        error: "question_extraction_empty",
+        message: "OpenAI did not return extracted question text.",
+        requestId,
+      },
+      {
+        status: 502,
+        headers: requestId ? { "X-OpenAI-Request-Id": requestId } : undefined,
+      },
+    );
+  }
+
+  return {
+    ...decision,
+    openAiRequestId: requestId,
+  };
 }
 
 async function uploadSessionPhoto(
@@ -514,90 +861,17 @@ async function uploadSessionPhoto(
     return originalFilename;
   }
 
-  const photoId = crypto.randomUUID();
-  const uploadedAt = nowIso();
-  const sha256 = await crypto.subtle.digest("SHA-256", bytes);
-  const sha256Hex = toHex(sha256);
-  const r2Key = photoObjectKey(sessionId, photoId, contentType);
-  let object: R2Object | null;
-
-  try {
-    object = await bucket.put(r2Key, bytes, {
-      httpMetadata: {
-        contentType,
-        cacheControl: "private, max-age=0, no-store",
-      },
-      customMetadata: {
-        sessionId,
-        userId: accessContext.userId,
-        sha256: sha256Hex,
-        uploadedAt,
-      },
-      sha256,
-    });
-  } catch (error) {
-    console.error(
-      JSON.stringify({
-        service: SERVICE_NAME,
-        event: "r2_photo_upload_failed",
-        sessionId,
-        message: error instanceof Error ? error.message : "Unknown R2 upload error",
-      }),
-    );
-
-    return jsonResponse(
-      {
-        error: "photo_upload_failed",
-        message: "Failed to store the photo.",
-      },
-      { status: 502 },
-    );
-  }
-
-  if (!object) {
-    return jsonResponse(
-      {
-        error: "photo_upload_failed",
-        message: "Failed to store the photo.",
-      },
-      { status: 502 },
-    );
-  }
-
-  const metadata: PhotoMetadata = {
-    id: photoId,
+  const metadata = await storeSessionPhoto({
+    bucket,
+    db: env.TUTOR_DB,
+    bytes,
+    contentType,
+    originalFilename,
     sessionId,
     userId: accessContext.userId,
-    r2Key,
-    contentType,
-    sizeBytes: bytes.byteLength,
-    sha256Hex,
-    etag: object.etag,
-    originalFilename: sanitizeFilename(originalFilename),
-    uploadedAt,
-  };
-
-  try {
-    await persistPhotoMetadata(env.TUTOR_DB, metadata);
-  } catch (error) {
-    await deleteUploadedPhotoBestEffort(bucket, r2Key, sessionId, photoId);
-    console.error(
-      JSON.stringify({
-        service: SERVICE_NAME,
-        event: "photo_metadata_persist_failed",
-        sessionId,
-        photoId,
-        message: error instanceof Error ? error.message : "Unknown D1 photo metadata error",
-      }),
-    );
-
-    return jsonResponse(
-      {
-        error: "photo_metadata_failed",
-        message: "Failed to store photo metadata.",
-      },
-      { status: 500 },
-    );
+  });
+  if (metadata instanceof Response) {
+    return metadata;
   }
 
   return jsonResponse(
@@ -1027,6 +1301,104 @@ async function persistPhotoMetadata(db: D1Database, metadata: PhotoMetadata): Pr
   ]);
 }
 
+async function storeSessionPhoto(input: {
+  bucket: R2Bucket;
+  db: D1Database;
+  bytes: ArrayBuffer;
+  contentType: string;
+  originalFilename: string | null;
+  sessionId: string;
+  userId: string;
+}): Promise<PhotoMetadata | Response> {
+  const photoId = crypto.randomUUID();
+  const uploadedAt = nowIso();
+  const sha256 = await crypto.subtle.digest("SHA-256", input.bytes);
+  const sha256Hex = toHex(sha256);
+  const r2Key = photoObjectKey(input.sessionId, photoId, input.contentType);
+  let object: R2Object | null;
+
+  try {
+    object = await input.bucket.put(r2Key, input.bytes, {
+      httpMetadata: {
+        contentType: input.contentType,
+        cacheControl: "private, max-age=0, no-store",
+      },
+      customMetadata: {
+        sessionId: input.sessionId,
+        userId: input.userId,
+        sha256: sha256Hex,
+        uploadedAt,
+      },
+      sha256,
+    });
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        service: SERVICE_NAME,
+        event: "r2_photo_upload_failed",
+        sessionId: input.sessionId,
+        message: error instanceof Error ? error.message : "Unknown R2 upload error",
+      }),
+    );
+
+    return jsonResponse(
+      {
+        error: "photo_upload_failed",
+        message: "Failed to store the photo.",
+      },
+      { status: 502 },
+    );
+  }
+
+  if (!object) {
+    return jsonResponse(
+      {
+        error: "photo_upload_failed",
+        message: "Failed to store the photo.",
+      },
+      { status: 502 },
+    );
+  }
+
+  const metadata: PhotoMetadata = {
+    id: photoId,
+    sessionId: input.sessionId,
+    userId: input.userId,
+    r2Key,
+    contentType: input.contentType,
+    sizeBytes: input.bytes.byteLength,
+    sha256Hex,
+    etag: object.etag,
+    originalFilename: sanitizeFilename(input.originalFilename),
+    uploadedAt,
+  };
+
+  try {
+    await persistPhotoMetadata(input.db, metadata);
+  } catch (error) {
+    await deleteUploadedPhotoBestEffort(input.bucket, r2Key, input.sessionId, photoId);
+    console.error(
+      JSON.stringify({
+        service: SERVICE_NAME,
+        event: "photo_metadata_persist_failed",
+        sessionId: input.sessionId,
+        photoId,
+        message: error instanceof Error ? error.message : "Unknown D1 photo metadata error",
+      }),
+    );
+
+    return jsonResponse(
+      {
+        error: "photo_metadata_failed",
+        message: "Failed to store photo metadata.",
+      },
+      { status: 500 },
+    );
+  }
+
+  return metadata;
+}
+
 async function deleteUploadedPhotoBestEffort(
   bucket: R2Bucket,
   r2Key: string,
@@ -1123,6 +1495,53 @@ async function readResponseText(response: Response): Promise<string> {
   } catch (error) {
     return error instanceof Error ? `Could not read response body: ${error.message}` : "Could not read response body.";
   }
+}
+
+async function persistSessionEvents(
+  db: D1Database,
+  sessionId: string,
+  inputs: SessionEventInput[],
+): Promise<SessionEventRecord[] | Response> {
+  const nextSequence = await getNextEventSequence(db, sessionId);
+  const records: SessionEventRecord[] = [];
+
+  for (const [index, input] of inputs.entries()) {
+    const record = normalizeEventInput(input, sessionId, nextSequence + index);
+    if (record instanceof Response) {
+      return record;
+    }
+    records.push(record);
+  }
+
+  await db.batch(
+    records.map((record) =>
+      db.prepare(
+        `INSERT INTO tutor_session_events (
+          id,
+          session_id,
+          sequence,
+          event_type,
+          role,
+          modality,
+          content,
+          metadata_json,
+          client_created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        record.id,
+        record.sessionId,
+        record.sequence,
+        record.eventType,
+        record.role,
+        record.modality,
+        record.content,
+        record.metadataJson,
+        record.clientCreatedAt,
+      ),
+    ),
+  );
+
+  return records;
 }
 
 function normalizeEventInputs(body: JsonBody): SessionEventInput[] | Response {
@@ -1363,6 +1782,102 @@ function hasRawAudioPayload(input: SessionEventInput): boolean {
   return ["audio", "audioBase64", "audioBlob", "blob", "dataUri"].some(
     (key) => key in input,
   );
+}
+
+function extractOpenAIOutputText(body: unknown): string | null {
+  if (!isRecord(body)) {
+    return null;
+  }
+
+  if (typeof body.output_text === "string" && body.output_text.trim()) {
+    return body.output_text.trim();
+  }
+
+  const output = Array.isArray(body.output) ? body.output : [];
+  const textParts: string[] = [];
+
+  for (const outputItem of output) {
+    if (!isRecord(outputItem)) {
+      continue;
+    }
+
+    const content = Array.isArray(outputItem.content) ? outputItem.content : [];
+    for (const contentItem of content) {
+      if (!isRecord(contentItem)) {
+        continue;
+      }
+
+      if (typeof contentItem.text === "string" && contentItem.text.trim()) {
+        textParts.push(contentItem.text.trim());
+      }
+    }
+  }
+
+  return textParts.length > 0 ? textParts.join("\n").trim() : null;
+}
+
+function parseQuestionExtractionDecision(body: unknown): Omit<QuestionExtractionResult, "openAiRequestId"> | null {
+  const text = extractOpenAIOutputText(body);
+  if (!text) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+
+  if (!isRecord(parsed)) {
+    return null;
+  }
+
+  const extractedQuestion = stringField(parsed.extracted_question);
+  const reason = stringField(parsed.reason);
+  const blockers = Array.isArray(parsed.blockers)
+    ? parsed.blockers.filter((blocker): blocker is string => typeof blocker === "string")
+    : null;
+
+  if (
+    extractedQuestion === null ||
+    typeof parsed.is_tutorable !== "boolean" ||
+    typeof parsed.confidence !== "number" ||
+    reason === null ||
+    typeof parsed.needs_retake !== "boolean" ||
+    blockers === null
+  ) {
+    return null;
+  }
+
+  return {
+    extractedQuestion,
+    isTutorable: parsed.is_tutorable,
+    confidence: clampConfidence(parsed.confidence),
+    reason,
+    needsRetake: parsed.needs_retake,
+    blockers,
+  };
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" ? value.trim() : null;
+}
+
+function clampConfidence(value: number): number {
+  return Math.min(Math.max(value, 0), 1);
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = "";
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+
+  return btoa(binary);
 }
 
 function normalizeImageContentType(value: string | null): string | null {
