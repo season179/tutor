@@ -10,6 +10,14 @@
       "custom_domain": true
     }
   ],
+  "d1_databases": [
+    {
+      "binding": "TUTOR_DB",
+      "database_name": "tutor-sessions",
+      "database_id": "385d6c91-8d11-431c-87f0-3bac7c609fd0",
+      "migrations_dir": "migrations"
+    }
+  ],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1

@@ -28,7 +28,11 @@
     "worker:deploy": "wrangler deploy --config workers/tutor-backend/wrangler.jsonc",
     "worker:dev": "wrangler dev --config workers/tutor-backend/wrangler.jsonc",
     "worker:dry-run": "wrangler deploy --dry-run --config workers/tutor-backend/wrangler.jsonc",
-    "worker:types": "wrangler types --config workers/tutor-backend/wrangler.jsonc workers/tutor-backend/worker-configuration.d.ts"
+    "worker:types": "wrangler types --config workers/tutor-backend/wrangler.jsonc workers/tutor-backend/worker-configuration.d.ts",
+    "db:migrate:local": "wrangler d1 migrations apply tutor-sessions --local --config workers/tutor-backend/wrangler.jsonc",
+    "db:migrate:remote": "wrangler d1 migrations apply tutor-sessions --remote --config workers/tutor-backend/wrangler.jsonc",
+    "db:seed:local": "wrangler d1 execute tutor-sessions --local --config workers/tutor-backend/wrangler.jsonc --file workers/tutor-backend/seeds/dev-session.sql",
+    "db:recent:local": "wrangler d1 execute tutor-sessions --local --config workers/tutor-backend/wrangler.jsonc --command \"SELECT id, started_at, ended_at, status, model_id, photo_r2_key, error_summary FROM tutor_sessions ORDER BY started_at DESC LIMIT 10\""
   },
   "private": true,
   "devDependencies": {
