@@ -1,10 +1,12 @@
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { File } from 'expo-file-system';
+import * as ImagePicker from 'expo-image-picker';
 import { StatusBar } from 'expo-status-bar';
 import {
   ArrowLeft,
   Camera,
   Check,
+  ImagePlus,
   LogOut,
   Mic,
   MicOff,
@@ -34,11 +36,13 @@ import {
 import { extractAccessCookie, type TutorAccess } from './src/tutorBackend';
 import { runNativeWebRTCSmokeTest } from './src/webrtcSmoke';
 
-type Screen = 'home' | 'camera' | 'preview' | 'auth' | 'tutor';
+type Screen = 'home' | 'source' | 'camera' | 'preview' | 'auth' | 'tutor';
 type CapturedPhoto = {
   uri: string;
   width: number;
   height: number;
+  contentType: string;
+  deleteAfterUse: boolean;
 };
 
 const ACCESS_COOKIE_SCRIPT = `
@@ -50,13 +54,13 @@ const ACCESS_COOKIE_SCRIPT = `
   true;
 `;
 
-function deleteTemporaryPhoto(uri?: string) {
-  if (!uri || Platform.OS === 'web' || uri.startsWith('data:')) {
+function deleteTemporaryPhoto(photo?: CapturedPhoto | null) {
+  if (!photo?.deleteAfterUse || Platform.OS === 'web' || photo.uri.startsWith('data:')) {
     return;
   }
 
   try {
-    const file = new File(uri);
+    const file = new File(photo.uri);
     if (file.exists) {
       file.delete();
     }
@@ -65,7 +69,7 @@ function deleteTemporaryPhoto(uri?: string) {
   }
 }
 
-function photoContentType(uri: string): string {
+function contentTypeFromUri(uri: string): string {
   const normalized = uri.toLowerCase();
   if (normalized.endsWith('.png')) {
     return 'image/png';
@@ -80,6 +84,10 @@ function photoContentType(uri: string): string {
     return 'image/heif';
   }
   return 'image/jpeg';
+}
+
+function photoContentType(photo: CapturedPhoto): string {
+  return photo.contentType || contentTypeFromUri(photo.uri);
 }
 
 function messageFromError(error: unknown): string {
@@ -105,13 +113,14 @@ export default function App() {
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [hasCameraPreviewTimedOut, setHasCameraPreviewTimedOut] = useState(false);
   const [isTakingPhoto, setIsTakingPhoto] = useState(false);
+  const [isPickingPhoto, setIsPickingPhoto] = useState(false);
   const [isStartingTutor, setIsStartingTutor] = useState(false);
   const [isEndingTutor, setIsEndingTutor] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    return () => deleteTemporaryPhoto(photo?.uri);
-  }, [photo?.uri]);
+    return () => deleteTemporaryPhoto(photo);
+  }, [photo]);
 
   useEffect(() => {
     tutorSessionRef.current = tutorSession;
@@ -173,6 +182,11 @@ export default function App() {
     setAssistantDraft('');
   }
 
+  function openPhotoSource() {
+    setErrorMessage(null);
+    setScreen('source');
+  }
+
   async function openCamera() {
     setErrorMessage(null);
     setHasCameraPreviewTimedOut(false);
@@ -193,7 +207,7 @@ export default function App() {
   }
 
   function returnHome() {
-    deleteTemporaryPhoto(photo?.uri);
+    deleteTemporaryPhoto(photo);
     setPhoto(null);
     setTutorSession(null);
     accessStartRef.current = false;
@@ -203,6 +217,7 @@ export default function App() {
     setIsMuted(false);
     setIsCameraAvailable(null);
     setIsTakingPhoto(false);
+    setIsPickingPhoto(false);
     setIsCameraReady(false);
     setHasCameraPreviewTimedOut(false);
     setIsStartingTutor(false);
@@ -232,6 +247,8 @@ export default function App() {
           uri: result.uri,
           width: result.width,
           height: result.height,
+          contentType: contentTypeFromUri(result.uri),
+          deleteAfterUse: true,
         });
         setScreen('preview');
       }
@@ -242,8 +259,50 @@ export default function App() {
     }
   }
 
+  async function chooseExistingPhoto() {
+    if (isPickingPhoto) {
+      return;
+    }
+
+    setIsPickingPhoto(true);
+    setErrorMessage(null);
+
+    try {
+      const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync(false);
+      if (!permissionResult.granted) {
+        setErrorMessage('Photo library access is needed.');
+        return;
+      }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        allowsEditing: false,
+        mediaTypes: ['images'],
+        quality: 0.85,
+      });
+
+      if (result.canceled || !result.assets[0]) {
+        return;
+      }
+
+      const asset = result.assets[0];
+      deleteTemporaryPhoto(photo);
+      setPhoto({
+        uri: asset.uri,
+        width: asset.width,
+        height: asset.height,
+        contentType: asset.mimeType || contentTypeFromUri(asset.uri),
+        deleteAfterUse: false,
+      });
+      setScreen('preview');
+    } catch {
+      setErrorMessage('Could not choose photo.');
+    } finally {
+      setIsPickingPhoto(false);
+    }
+  }
+
   function retakePhoto() {
-    deleteTemporaryPhoto(photo?.uri);
+    deleteTemporaryPhoto(photo);
     setPhoto(null);
     accessStartRef.current = false;
     setErrorMessage(null);
@@ -276,7 +335,7 @@ export default function App() {
         backendUrl: TUTOR_BACKEND_URL,
         access: nextAccess,
         photoUri: photo.uri,
-        photoContentType: photoContentType(photo.uri),
+        photoContentType: photoContentType(photo),
         onStatus: setStatusText,
         onTranscript: appendTranscript,
         onAssistantDelta: (delta) => {
@@ -288,7 +347,7 @@ export default function App() {
         },
       });
       setTutorSession(session);
-      deleteTemporaryPhoto(photo.uri);
+      deleteTemporaryPhoto(photo);
       setPhoto(null);
       setStatusText('Listening...');
     } catch (error) {
@@ -353,6 +412,46 @@ export default function App() {
     }
   }
 
+  if (screen === 'source') {
+    return (
+      <SafeAreaView style={styles.sourceScreen}>
+        <StatusBar style="dark" />
+        <View style={styles.sourceHeader}>
+          <Pressable
+            accessibilityLabel="Back"
+            hitSlop={12}
+            onPress={returnHome}
+            style={styles.lightIconButton}
+          >
+            <ArrowLeft color="#111827" size={25} strokeWidth={2.3} />
+          </Pressable>
+        </View>
+        <View style={styles.sourceContent}>
+          <Text style={styles.sourceTitle}>Question photo</Text>
+          <View style={styles.sourceActions}>
+            <Pressable onPress={openCamera} style={styles.sourcePrimaryButton}>
+              <Camera color="#ffffff" size={21} strokeWidth={2.4} />
+              <Text style={styles.sourcePrimaryButtonText}>Use camera</Text>
+            </Pressable>
+            <Pressable
+              disabled={isPickingPhoto}
+              onPress={() => void chooseExistingPhoto()}
+              style={[styles.sourceSecondaryButton, isPickingPhoto && styles.disabledButton]}
+            >
+              {isPickingPhoto ? (
+                <ActivityIndicator color="#111827" />
+              ) : (
+                <ImagePlus color="#111827" size={21} strokeWidth={2.4} />
+              )}
+              <Text style={styles.sourceSecondaryButtonText}>Choose photo</Text>
+            </Pressable>
+          </View>
+          {errorMessage ? <Text style={styles.sourceErrorText}>{errorMessage}</Text> : null}
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   if (screen === 'camera') {
     return (
       <SafeAreaView style={styles.cameraScreen}>
@@ -360,7 +459,7 @@ export default function App() {
         <View style={styles.cameraHeader}>
           <Pressable
             accessibilityLabel="Back"
-            hitSlop={12}
+            hitSlop={20}
             onPress={returnHome}
             style={styles.iconButton}
           >
@@ -401,6 +500,18 @@ export default function App() {
         {permission?.granted && isCameraAvailable !== false && !hasCameraPreviewTimedOut ? (
           <View style={styles.cameraFooter}>
             <Pressable
+              accessibilityLabel="Choose photo"
+              disabled={isPickingPhoto}
+              onPress={() => void chooseExistingPhoto()}
+              style={[styles.cameraGalleryButton, isPickingPhoto && styles.disabledButton]}
+            >
+              {isPickingPhoto ? (
+                <ActivityIndicator color="#ffffff" />
+              ) : (
+                <ImagePlus color="#ffffff" size={25} strokeWidth={2.4} />
+              )}
+            </Pressable>
+            <Pressable
               accessibilityLabel="Take photo"
               disabled={!isCameraReady || isTakingPhoto}
               onPress={takePhoto}
@@ -411,6 +522,7 @@ export default function App() {
             >
               <View style={styles.shutterInner} />
             </Pressable>
+            <View style={styles.cameraFooterSpacer} />
           </View>
         ) : null}
       </SafeAreaView>
@@ -580,7 +692,7 @@ export default function App() {
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Hi!</Text>
-      <Pressable onPress={openCamera} style={styles.captureButton}>
+      <Pressable onPress={openPhotoSource} style={styles.captureButton}>
         <Camera color="#ffffff" size={22} strokeWidth={2.4} />
         <Text style={styles.captureButtonText}>Capture</Text>
       </Pressable>
@@ -618,6 +730,64 @@ const styles = StyleSheet.create({
     fontSize: 17,
     fontWeight: '700',
   },
+  sourceScreen: {
+    backgroundColor: '#ffffff',
+    flex: 1,
+  },
+  sourceHeader: {
+    padding: 18,
+  },
+  sourceContent: {
+    flex: 1,
+    gap: 24,
+    justifyContent: 'center',
+    padding: 24,
+  },
+  sourceTitle: {
+    color: '#111827',
+    fontSize: 32,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  sourceActions: {
+    gap: 14,
+  },
+  sourcePrimaryButton: {
+    alignItems: 'center',
+    backgroundColor: '#111827',
+    borderRadius: 8,
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'center',
+    minHeight: 56,
+    paddingHorizontal: 18,
+  },
+  sourcePrimaryButtonText: {
+    color: '#ffffff',
+    fontSize: 17,
+    fontWeight: '800',
+  },
+  sourceSecondaryButton: {
+    alignItems: 'center',
+    backgroundColor: '#f3f4f6',
+    borderRadius: 8,
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'center',
+    minHeight: 56,
+    paddingHorizontal: 18,
+  },
+  sourceSecondaryButtonText: {
+    color: '#111827',
+    fontSize: 17,
+    fontWeight: '800',
+  },
+  sourceErrorText: {
+    color: '#b91c1c',
+    fontSize: 15,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
   cameraScreen: {
     backgroundColor: '#000000',
     flex: 1,
@@ -625,16 +795,16 @@ const styles = StyleSheet.create({
   cameraHeader: {
     left: 18,
     position: 'absolute',
-    top: 18,
+    top: 58,
     zIndex: 2,
   },
   iconButton: {
     alignItems: 'center',
     backgroundColor: 'rgba(17, 24, 39, 0.58)',
-    borderRadius: 24,
-    height: 48,
+    borderRadius: 28,
+    height: 56,
     justifyContent: 'center',
-    width: 48,
+    width: 56,
   },
   lightIconButton: {
     alignItems: 'center',
@@ -670,9 +840,23 @@ const styles = StyleSheet.create({
   cameraFooter: {
     alignItems: 'center',
     bottom: 42,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
     left: 0,
+    paddingHorizontal: 34,
     position: 'absolute',
     right: 0,
+  },
+  cameraGalleryButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(17, 24, 39, 0.58)',
+    borderRadius: 28,
+    height: 56,
+    justifyContent: 'center',
+    width: 56,
+  },
+  cameraFooterSpacer: {
+    width: 56,
   },
   shutterButton: {
     alignItems: 'center',

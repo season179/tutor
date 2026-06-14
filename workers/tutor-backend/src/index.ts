@@ -10,6 +10,7 @@ const MAX_EVENT_CONTENT_LENGTH = 16_000;
 const MAX_EVENT_METADATA_LENGTH = 16_000;
 const MAX_EVENTS_PER_REQUEST = 50;
 const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
+const MAX_OPENAI_ERROR_LOG_LENGTH = 4_000;
 
 type SecretEnv = {
   OPENAI_API_KEY?: string;
@@ -286,6 +287,8 @@ async function createRealtimeSession(request: Request, env: TutorEnv): Promise<R
   const requestId = openAiResponse.headers.get("x-request-id");
 
   if (!openAiResponse.ok) {
+    const errorBody = await readResponseText(openAiResponse);
+
     await markSessionFailed(
       db,
       sessionId,
@@ -299,6 +302,7 @@ async function createRealtimeSession(request: Request, env: TutorEnv): Promise<R
         event: "openai_realtime_session_failed",
         status: openAiResponse.status,
         requestId,
+        errorBody,
       }),
     );
 
@@ -807,7 +811,7 @@ function realtimeSessionConfig(env: TutorEnv): JsonBody {
     type: "realtime",
     model: env.OPENAI_REALTIME_MODEL || DEFAULT_MODEL,
     instructions: TUTOR_INSTRUCTIONS,
-    output_modalities: ["audio", "text"],
+    output_modalities: ["audio"],
     reasoning: {
       effort: "low",
     },
@@ -1080,6 +1084,14 @@ async function readJsonBody(
       },
       { status: 400 },
     );
+  }
+}
+
+async function readResponseText(response: Response): Promise<string> {
+  try {
+    return (await response.text()).slice(0, MAX_OPENAI_ERROR_LOG_LENGTH);
+  } catch (error) {
+    return error instanceof Error ? `Could not read response body: ${error.message}` : "Could not read response body.";
   }
 }
 
@@ -1428,7 +1440,7 @@ async function safetyIdentifier(email: string, salt: string): Promise<string> {
     ["sign"],
   );
   const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(email));
-  return `family-tutor:${toHex(signature)}`;
+  return toHex(signature);
 }
 
 function toHex(buffer: ArrayBuffer): string {

@@ -14,6 +14,14 @@
         }
       ],
       [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow tutor to use your photo library to choose an existing question photo.",
+          "cameraPermission": "Allow tutor to use the camera to capture a question photo.",
+          "microphonePermission": false
+        }
+      ],
+      [
         "@config-plugins/react-native-webrtc",
         {
           "cameraPermission": "Allow tutor to use the camera for photographed questions and tutor sessions.",

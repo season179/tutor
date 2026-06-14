@@ -26,6 +26,9 @@ importers:
       expo-file-system:
         specifier: ~56.0.8
         version: 56.0.8(expo@56.0.11)(react-native@0.85.3(@babel/core@7.29.7)(@types/react@19.2.17)(react@19.2.3))
+      expo-image-picker:
+        specifier: ~56.0.17
+        version: 56.0.17(expo@56.0.11)
       expo-status-bar:
         specifier: ~56.0.4
         version: 56.0.4(expo@56.0.11)(react-native@0.85.3(@babel/core@7.29.7)(@types/react@19.2.17)(react@19.2.3))(react@19.2.3)
@@ -1568,6 +1571,16 @@ packages:
       expo: '*'
       react: '*'
       react-native: '*'
+
+  expo-image-loader@56.0.3:
+    resolution: {integrity: sha512-JgUo4fUeU1ZC+z8iBFj8v7yoGQnZrLbOVPyNE+DWVrld55F2F6R1ck+rmdm/8TNWLz1LhNQfD7c3XYP1ZikxXA==}
+    peerDependencies:
+      expo: '*'
+
+  expo-image-picker@56.0.17:
+    resolution: {integrity: sha512-/RojW1ptyQNV89hEeDdaoHCkn38+546MqakMyB0acFf0HLh5ZI7wxQCHkxr16qjuQMy11M+96GlX9Z6vgXF7Nw==}
+    peerDependencies:
+      expo: '*'
 
   expo-json-utils@56.0.0:
     resolution: {integrity: sha512-lUqyv9aIGDbYTQ5Nux2FnH2/Dz0w5uJ8Pr080eS0StXi2jr5OmuMNErpzUnpfnYOU55xKotd4AHv68PfV/ludg==}
@@ -4457,6 +4470,15 @@ snapshots:
       fontfaceobserver: 2.3.0
       react: 19.2.3
       react-native: 0.85.3(@babel/core@7.29.7)(@types/react@19.2.17)(react@19.2.3)
+
+  expo-image-loader@56.0.3(expo@56.0.11):
+    dependencies:
+      expo: 56.0.11(@babel/core@7.29.7)(@expo/dom-webview@56.0.5)(@expo/metro-runtime@56.0.15)(react-dom@19.2.3(react@19.2.3))(react-native-web@0.21.2(react-dom@19.2.3(react@19.2.3))(react@19.2.3))(react-native-webview@13.16.1(react-native@0.85.3(@babel/core@7.29.7)(@types/react@19.2.17)(react@19.2.3))(react@19.2.3))(react-native@0.85.3(@babel/core@7.29.7)(@types/react@19.2.17)(react@19.2.3))(react@19.2.3)(typescript@6.0.3)
+
+  expo-image-picker@56.0.17(expo@56.0.11):
+    dependencies:
+      expo: 56.0.11(@babel/core@7.29.7)(@expo/dom-webview@56.0.5)(@expo/metro-runtime@56.0.15)(react-dom@19.2.3(react@19.2.3))(react-native-web@0.21.2(react-dom@19.2.3(react@19.2.3))(react@19.2.3))(react-native-webview@13.16.1(react-native@0.85.3(@babel/core@7.29.7)(@types/react@19.2.17)(react@19.2.3))(react@19.2.3))(react-native@0.85.3(@babel/core@7.29.7)(@types/react@19.2.17)(react@19.2.3))(react@19.2.3)(typescript@6.0.3)
+      expo-image-loader: 56.0.3(expo@56.0.11)
 
   expo-json-utils@56.0.0: {}
 
