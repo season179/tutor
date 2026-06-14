@@ -3,7 +3,7 @@ import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 const OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const DEFAULT_MODEL = "gpt-realtime-2";
-const DEFAULT_QUESTION_EXTRACTION_MODEL = "gpt-5.4-nano";
+const DEFAULT_QUESTION_EXTRACTION_MODEL = "gpt-5.4-mini-2026-03-17";
 const DEFAULT_VOICE = "marin";
 const SERVICE_NAME = "tutor-backend";
 const MAX_SDP_LENGTH = 256_000;
