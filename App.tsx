@@ -101,7 +101,9 @@ export default function App() {
   const [followUpText, setFollowUpText] = useState('');
   const [statusText, setStatusText] = useState('Ready');
   const [isMuted, setIsMuted] = useState(false);
+  const [isCameraAvailable, setIsCameraAvailable] = useState<boolean | null>(null);
   const [isCameraReady, setIsCameraReady] = useState(false);
+  const [hasCameraPreviewTimedOut, setHasCameraPreviewTimedOut] = useState(false);
   const [isTakingPhoto, setIsTakingPhoto] = useState(false);
   const [isStartingTutor, setIsStartingTutor] = useState(false);
   const [isEndingTutor, setIsEndingTutor] = useState(false);
@@ -120,6 +122,24 @@ export default function App() {
       void tutorSessionRef.current?.end('cancelled');
     };
   }, []);
+
+  useEffect(() => {
+    if (
+      screen !== 'camera' ||
+      !permission?.granted ||
+      isCameraReady ||
+      isCameraAvailable === false
+    ) {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      setHasCameraPreviewTimedOut(true);
+      setErrorMessage('Camera preview did not start. Use a physical phone to take a photo.');
+    }, 7000);
+
+    return () => clearTimeout(timeout);
+  }, [isCameraAvailable, isCameraReady, permission?.granted, screen]);
 
   useEffect(() => {
     if (!__DEV__ || Platform.OS === 'web') {
@@ -155,7 +175,17 @@ export default function App() {
 
   async function openCamera() {
     setErrorMessage(null);
+    setHasCameraPreviewTimedOut(false);
     setScreen('camera');
+
+    if (Platform.OS === 'web') {
+      const cameraAvailable = await CameraView.isAvailableAsync();
+      setIsCameraAvailable(cameraAvailable);
+      if (!cameraAvailable) {
+        setErrorMessage('Camera is not available here. Use a physical phone to take a photo.');
+        return;
+      }
+    }
 
     if (!permission?.granted) {
       await requestPermission();
@@ -171,8 +201,10 @@ export default function App() {
     setAssistantDraft('');
     setFollowUpText('');
     setIsMuted(false);
+    setIsCameraAvailable(null);
     setIsTakingPhoto(false);
     setIsCameraReady(false);
+    setHasCameraPreviewTimedOut(false);
     setIsStartingTutor(false);
     setIsEndingTutor(false);
     setStatusText('Ready');
@@ -215,6 +247,8 @@ export default function App() {
     setPhoto(null);
     accessStartRef.current = false;
     setErrorMessage(null);
+    setIsCameraReady(false);
+    setHasCameraPreviewTimedOut(false);
     setScreen('camera');
   }
 
@@ -334,12 +368,20 @@ export default function App() {
           </Pressable>
         </View>
 
-        {permission?.granted ? (
+        {isCameraAvailable === false || hasCameraPreviewTimedOut ? (
+          <View style={styles.permissionPanel}>
+            <Text style={styles.permissionText}>Camera preview is not available here.</Text>
+            <Text style={styles.permissionSubtext}>Use a physical phone to take a photo.</Text>
+          </View>
+        ) : permission?.granted ? (
           <CameraView
             active={screen === 'camera'}
             facing="back"
             mode="picture"
-            onCameraReady={() => setIsCameraReady(true)}
+            onCameraReady={() => {
+              setHasCameraPreviewTimedOut(false);
+              setIsCameraReady(true);
+            }}
             ref={cameraRef}
             style={styles.camera}
           />
@@ -352,9 +394,11 @@ export default function App() {
           </View>
         )}
 
-        {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+        {errorMessage && isCameraAvailable !== false && !hasCameraPreviewTimedOut ? (
+          <Text style={styles.errorText}>{errorMessage}</Text>
+        ) : null}
 
-        {permission?.granted ? (
+        {permission?.granted && isCameraAvailable !== false && !hasCameraPreviewTimedOut ? (
           <View style={styles.cameraFooter}>
             <Pressable
               accessibilityLabel="Take photo"
@@ -614,6 +658,13 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 18,
     fontWeight: '700',
+    textAlign: 'center',
+  },
+  permissionSubtext: {
+    color: '#d1d5db',
+    fontSize: 15,
+    lineHeight: 21,
+    maxWidth: 280,
     textAlign: 'center',
   },
   cameraFooter: {
