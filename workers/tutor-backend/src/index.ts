@@ -9,6 +9,7 @@ const MAX_ERROR_SUMMARY_LENGTH = 1_000;
 const MAX_EVENT_CONTENT_LENGTH = 16_000;
 const MAX_EVENT_METADATA_LENGTH = 16_000;
 const MAX_EVENTS_PER_REQUEST = 50;
+const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 
 type SecretEnv = {
   OPENAI_API_KEY?: string;
@@ -54,6 +55,19 @@ type SessionEventRecord = {
   content: string | null;
   metadataJson: string | null;
   clientCreatedAt: string | null;
+};
+
+type PhotoMetadata = {
+  id: string;
+  sessionId: string;
+  userId: string;
+  r2Key: string;
+  contentType: string;
+  sizeBytes: number;
+  sha256Hex: string;
+  etag: string | null;
+  originalFilename: string | null;
+  uploadedAt: string;
 };
 
 const TUTOR_INSTRUCTIONS = `# Role and Objective
@@ -117,6 +131,7 @@ export default {
           openaiKeyConfigured: Boolean(env.OPENAI_API_KEY),
           safetySaltConfigured: Boolean(env.OPENAI_SAFETY_IDENTIFIER_SALT),
           d1Configured: Boolean(env.TUTOR_DB),
+          r2Configured: Boolean(env.TUTOR_PHOTOS),
           realtimeModel: env.OPENAI_REALTIME_MODEL || DEFAULT_MODEL,
           realtimeVoice: env.OPENAI_REALTIME_VOICE || DEFAULT_VOICE,
         },
@@ -133,8 +148,24 @@ export default {
     }
 
     const sessionRoute = parseSessionRoute(url.pathname);
-    if (sessionRoute && request.method === "POST") {
-      if (sessionRoute.action === "events") {
+    if (sessionRoute) {
+      if (sessionRoute.action === "photos" && request.method === "GET") {
+        return withCors(
+          await listSessionPhotos(request, env, sessionRoute.sessionId),
+          request,
+          env,
+        );
+      }
+
+      if (sessionRoute.action === "photo" && request.method === "POST") {
+        return withCors(
+          await uploadSessionPhoto(request, env, sessionRoute.sessionId),
+          request,
+          env,
+        );
+      }
+
+      if (sessionRoute.action === "events" && request.method === "POST") {
         return withCors(
           await appendSessionEvents(request, env, sessionRoute.sessionId),
           request,
@@ -142,11 +173,13 @@ export default {
         );
       }
 
-      return withCors(
-        await finishSession(request, env, sessionRoute.sessionId),
-        request,
-        env,
-      );
+      if (sessionRoute.action === "finish" && request.method === "POST") {
+        return withCors(
+          await finishSession(request, env, sessionRoute.sessionId),
+          request,
+          env,
+        );
+      }
     }
 
     return jsonResponse(
@@ -389,6 +422,211 @@ async function appendSessionEvents(
   });
 }
 
+async function uploadSessionPhoto(
+  request: Request,
+  env: TutorEnv,
+  sessionId: string,
+): Promise<Response> {
+  const accessContext = await requireAccessContext(request, env);
+  if (accessContext instanceof Response) {
+    return accessContext;
+  }
+
+  const owner = await assertSessionOwner(env.TUTOR_DB, sessionId, accessContext.userId);
+  if (owner instanceof Response) {
+    return owner;
+  }
+
+  const bucket = requiredPhotoBucket(env);
+  if (bucket instanceof Response) {
+    return bucket;
+  }
+
+  const contentType = normalizeImageContentType(request.headers.get("content-type"));
+  if (!contentType) {
+    return jsonResponse(
+      {
+        error: "unsupported_media_type",
+        message: "Upload a JPEG, PNG, WebP, HEIC, or HEIF image.",
+      },
+      { status: 415 },
+    );
+  }
+
+  const declaredLength = parseContentLength(request.headers.get("content-length"));
+  if (declaredLength > MAX_PHOTO_BYTES) {
+    return photoTooLarge();
+  }
+
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength === 0) {
+    return jsonResponse(
+      {
+        error: "empty_photo",
+        message: "Photo upload body cannot be empty.",
+      },
+      { status: 400 },
+    );
+  }
+
+  if (bytes.byteLength > MAX_PHOTO_BYTES) {
+    return photoTooLarge();
+  }
+
+  const originalFilename = parseOptionalHeader(
+    request.headers.get("x-tutor-photo-filename"),
+    200,
+  );
+  if (originalFilename instanceof Response) {
+    return originalFilename;
+  }
+
+  const photoId = crypto.randomUUID();
+  const uploadedAt = nowIso();
+  const sha256 = await crypto.subtle.digest("SHA-256", bytes);
+  const sha256Hex = toHex(sha256);
+  const r2Key = photoObjectKey(sessionId, photoId, contentType);
+  let object: R2Object | null;
+
+  try {
+    object = await bucket.put(r2Key, bytes, {
+      httpMetadata: {
+        contentType,
+        cacheControl: "private, max-age=0, no-store",
+      },
+      customMetadata: {
+        sessionId,
+        userId: accessContext.userId,
+        sha256: sha256Hex,
+        uploadedAt,
+      },
+      sha256,
+    });
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        service: SERVICE_NAME,
+        event: "r2_photo_upload_failed",
+        sessionId,
+        message: error instanceof Error ? error.message : "Unknown R2 upload error",
+      }),
+    );
+
+    return jsonResponse(
+      {
+        error: "photo_upload_failed",
+        message: "Failed to store the photo.",
+      },
+      { status: 502 },
+    );
+  }
+
+  if (!object) {
+    return jsonResponse(
+      {
+        error: "photo_upload_failed",
+        message: "Failed to store the photo.",
+      },
+      { status: 502 },
+    );
+  }
+
+  const metadata: PhotoMetadata = {
+    id: photoId,
+    sessionId,
+    userId: accessContext.userId,
+    r2Key,
+    contentType,
+    sizeBytes: bytes.byteLength,
+    sha256Hex,
+    etag: object.etag,
+    originalFilename: sanitizeFilename(originalFilename),
+    uploadedAt,
+  };
+
+  try {
+    await persistPhotoMetadata(env.TUTOR_DB, metadata);
+  } catch (error) {
+    await deleteUploadedPhotoBestEffort(bucket, r2Key, sessionId, photoId);
+    console.error(
+      JSON.stringify({
+        service: SERVICE_NAME,
+        event: "photo_metadata_persist_failed",
+        sessionId,
+        photoId,
+        message: error instanceof Error ? error.message : "Unknown D1 photo metadata error",
+      }),
+    );
+
+    return jsonResponse(
+      {
+        error: "photo_metadata_failed",
+        message: "Failed to store photo metadata.",
+      },
+      { status: 500 },
+    );
+  }
+
+  return jsonResponse(
+    {
+      ok: true,
+      sessionId,
+      photo: {
+        id: metadata.id,
+        r2Key: metadata.r2Key,
+        contentType: metadata.contentType,
+        sizeBytes: metadata.sizeBytes,
+        sha256Hex: metadata.sha256Hex,
+        uploadedAt: metadata.uploadedAt,
+      },
+    },
+    {
+      headers: {
+        "X-Tutor-Photo-Key": metadata.r2Key,
+      },
+    },
+  );
+}
+
+async function listSessionPhotos(
+  request: Request,
+  env: TutorEnv,
+  sessionId: string,
+): Promise<Response> {
+  const accessContext = await requireAccessContext(request, env);
+  if (accessContext instanceof Response) {
+    return accessContext;
+  }
+
+  const owner = await assertSessionOwner(env.TUTOR_DB, sessionId, accessContext.userId);
+  if (owner instanceof Response) {
+    return owner;
+  }
+
+  const { results } = await env.TUTOR_DB.prepare(
+    `SELECT
+        id,
+        r2_key,
+        content_type,
+        size_bytes,
+        sha256_hex,
+        etag,
+        original_filename,
+        uploaded_at
+      FROM tutor_session_photos
+      WHERE session_id = ? AND user_id = ?
+      ORDER BY uploaded_at DESC`,
+  )
+    .bind(sessionId, accessContext.userId)
+    .all();
+
+  return jsonResponse({
+    ok: true,
+    sessionId,
+    photos: results,
+  });
+}
+
 async function finishSession(
   request: Request,
   env: TutorEnv,
@@ -588,6 +826,14 @@ function requiredDatabase(env: TutorEnv): D1Database | Response {
   return env.TUTOR_DB;
 }
 
+function requiredPhotoBucket(env: TutorEnv): R2Bucket | Response {
+  if (!env.TUTOR_PHOTOS) {
+    return configurationError("TUTOR_PHOTOS R2 binding is not configured.");
+  }
+
+  return env.TUTOR_PHOTOS;
+}
+
 async function createSessionRow(
   db: D1Database,
   input: {
@@ -699,17 +945,81 @@ async function getNextEventSequence(db: D1Database, sessionId: string): Promise<
   return result?.next_sequence ?? 1;
 }
 
-function parseSessionRoute(
-  pathname: string,
-): { sessionId: string; action: "events" | "finish" } | null {
-  const match = pathname.match(/^\/sessions\/([^/]+)\/(events|finish)$/);
+async function persistPhotoMetadata(db: D1Database, metadata: PhotoMetadata): Promise<void> {
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO tutor_session_photos (
+          id,
+          session_id,
+          user_id,
+          r2_key,
+          content_type,
+          size_bytes,
+          sha256_hex,
+          etag,
+          original_filename,
+          uploaded_at,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        metadata.id,
+        metadata.sessionId,
+        metadata.userId,
+        metadata.r2Key,
+        metadata.contentType,
+        metadata.sizeBytes,
+        metadata.sha256Hex,
+        metadata.etag,
+        metadata.originalFilename,
+        metadata.uploadedAt,
+        metadata.uploadedAt,
+      ),
+    db
+      .prepare(
+        `UPDATE tutor_sessions
+          SET photo_r2_key = ?,
+              updated_at = ?
+          WHERE id = ? AND user_id = ?`,
+      )
+      .bind(metadata.r2Key, metadata.uploadedAt, metadata.sessionId, metadata.userId),
+  ]);
+}
+
+async function deleteUploadedPhotoBestEffort(
+  bucket: R2Bucket,
+  r2Key: string,
+  sessionId: string,
+  photoId: string,
+): Promise<void> {
+  try {
+    await bucket.delete(r2Key);
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        service: SERVICE_NAME,
+        event: "r2_photo_cleanup_failed",
+        sessionId,
+        photoId,
+        message: error instanceof Error ? error.message : "Unknown R2 cleanup error",
+      }),
+    );
+  }
+}
+
+function parseSessionRoute(pathname: string): {
+  sessionId: string;
+  action: "events" | "finish" | "photo" | "photos";
+} | null {
+  const match = pathname.match(/^\/sessions\/([^/]+)\/(events|finish|photo|photos)$/);
   if (!match) {
     return null;
   }
 
   return {
     sessionId: decodeURIComponent(match[1]),
-    action: match[2] as "events" | "finish",
+    action: match[2] as "events" | "finish" | "photo" | "photos",
   };
 }
 
@@ -1007,6 +1317,61 @@ function hasRawAudioPayload(input: SessionEventInput): boolean {
   );
 }
 
+function normalizeImageContentType(value: string | null): string | null {
+  const contentType = value?.split(";")[0]?.trim().toLowerCase() || null;
+  return imageExtension(contentType) ? contentType : null;
+}
+
+function imageExtension(contentType: string | null | undefined): string | null {
+  switch (contentType) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/png":
+      return "png";
+    case "image/webp":
+      return "webp";
+    case "image/heic":
+      return "heic";
+    case "image/heif":
+      return "heif";
+    default:
+      return null;
+  }
+}
+
+function photoObjectKey(sessionId: string, photoId: string, contentType: string): string {
+  const extension = imageExtension(contentType) || "bin";
+  return `sessions/${sessionId}/photos/${photoId}.${extension}`;
+}
+
+function parseContentLength(value: string | null): number {
+  if (!value) {
+    return 0;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function photoTooLarge(): Response {
+  return jsonResponse(
+    {
+      error: "photo_too_large",
+      message: `Photo must be ${MAX_PHOTO_BYTES} bytes or less.`,
+    },
+    { status: 413 },
+  );
+}
+
+function sanitizeFilename(value: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const withoutPath = value.split(/[\\/]/).at(-1)?.trim() || null;
+  return withoutPath ? withoutPath.slice(0, 200) : null;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -1138,8 +1503,9 @@ function corsHeaders(request: Request, env: TutorEnv): Record<string, string> {
   const headers: Record<string, string> = {
     Vary: "Origin",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,Cf-Access-Jwt-Assertion,X-Tutor-Photo-Key",
-    "Access-Control-Expose-Headers": "X-Tutor-Session-Id,X-OpenAI-Request-Id",
+    "Access-Control-Allow-Headers":
+      "Content-Type,Cf-Access-Jwt-Assertion,X-Tutor-Photo-Key,X-Tutor-Photo-Filename",
+    "Access-Control-Expose-Headers": "X-Tutor-Session-Id,X-OpenAI-Request-Id,X-Tutor-Photo-Key",
     "Access-Control-Max-Age": "86400",
   };
 
