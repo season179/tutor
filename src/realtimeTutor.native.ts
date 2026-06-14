@@ -295,7 +295,7 @@ function sendQuestionImage(dataChannel: TutorDataChannel, image: PreparedRealtim
         content: [
           {
             type: 'input_text',
-            text: 'Please read this question photo and help me solve it. Guide me step by step and ask one small question at a time.',
+            text: 'Please analyze this question photo first. If you can read the question, start the conversation by gently saying what you see, then ask the child one small guiding question. Match the language in the photo unless the child speaks or types another language.',
           },
           {
             type: 'input_image',
