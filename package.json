@@ -18,13 +18,14 @@
     "react-native": "0.85.3",
     "react-native-svg": "15.15.4",
     "react-native-web": "^0.21.2",
-    "react-native-webrtc": "^124.0.7"
+    "react-native-webrtc": "^124.0.7",
+    "react-native-webview": "13.16.1"
   },
   "scripts": {
     "start": "expo start",
     "start:dev-client": "expo start --dev-client",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
     "dev:android": "expo run:android",
     "dev:ios": "expo run:ios",
     "web": "expo start --web",
