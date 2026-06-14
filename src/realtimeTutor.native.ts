@@ -82,6 +82,7 @@ type RealtimeEventContext = {
   access: TutorAccess;
   backendUrl: string;
   getSessionId: () => string | null;
+  diagnostics: RealtimeDiagnosticsState;
 };
 
 type RealtimeEventWaiter = {
@@ -89,6 +90,11 @@ type RealtimeEventWaiter = {
   rejectPredicate: (event: RealtimeServerEvent) => boolean;
   resolve: (event: RealtimeServerEvent) => void;
   reject: (error: Error) => void;
+};
+
+type RealtimeDiagnosticsState = {
+  activeResponseId: string | null;
+  responseActive: boolean;
 };
 
 export async function startTutorRealtimeSession(
@@ -100,6 +106,10 @@ export async function startTutorRealtimeSession(
   let dataChannel: TutorDataChannel | null = null;
   let backendSession: TutorBackendSession | null = null;
   const realtimeEvents = createRealtimeEventBus();
+  const diagnostics: RealtimeDiagnosticsState = {
+    activeResponseId: null,
+    responseActive: false,
+  };
 
   try {
     await preferSpeakerOutput();
@@ -126,6 +136,7 @@ export async function startTutorRealtimeSession(
         access: input.access,
         backendUrl: input.backendUrl,
         getSessionId: () => backendSession?.sessionId || null,
+        diagnostics,
       });
     });
 
@@ -693,12 +704,17 @@ function handleServerEvent(
       input.onStatus('Tutor connected.');
       break;
     case 'input_audio_buffer.speech_started':
+      logRealtimeDiagnosticEvent(context, 'realtime_speech_started', event);
       input.onStatus('Listening...');
       break;
     case 'input_audio_buffer.speech_stopped':
+      logRealtimeDiagnosticEvent(context, 'realtime_speech_stopped', event);
       input.onStatus('Tutor is thinking...');
       break;
     case 'response.created':
+      context.diagnostics.responseActive = true;
+      context.diagnostics.activeResponseId = event.response?.id || null;
+      logRealtimeDiagnosticEvent(context, 'realtime_response_created', event);
       input.onStatus('Tutor is speaking...');
       break;
     case 'response.output_text.delta':
@@ -720,6 +736,9 @@ function handleServerEvent(
       break;
     case 'response.done':
       logResponseUsage(context, event);
+      logRealtimeDiagnosticEvent(context, 'realtime_response_done', event);
+      context.diagnostics.responseActive = false;
+      context.diagnostics.activeResponseId = null;
       input.onStatus('Listening...');
       break;
     case 'error':
@@ -738,6 +757,50 @@ function handleServerEvent(
       input.onError(realtimeErrorMessage(event));
       break;
   }
+}
+
+function logRealtimeDiagnosticEvent(
+  context: RealtimeEventContext,
+  eventType: string,
+  event: RealtimeServerEvent,
+) {
+  const sessionId = context.getSessionId();
+  const metadata = {
+    realtimeEventType: event.type || null,
+    realtimeEventId: event.event_id || null,
+    duringResponse: context.diagnostics.responseActive,
+    activeResponseId: context.diagnostics.activeResponseId,
+    responseId: event.response?.id || null,
+    responseStatus: event.response?.status || null,
+  };
+
+  console.info(
+    JSON.stringify({
+      service: 'tutor-app',
+      event: eventType,
+      sessionId,
+      ...metadata,
+    }),
+  );
+
+  if (!sessionId) {
+    return;
+  }
+
+  void appendTutorEvents({
+    backendUrl: context.backendUrl,
+    access: context.access,
+    sessionId,
+    events: [
+      {
+        eventType,
+        role: 'system',
+        modality: 'data',
+        metadata,
+        clientCreatedAt: new Date().toISOString(),
+      },
+    ],
+  }).catch(() => undefined);
 }
 
 function logResponseUsage(context: RealtimeEventContext, event: RealtimeServerEvent) {

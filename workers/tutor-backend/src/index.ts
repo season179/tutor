@@ -1121,8 +1121,12 @@ function realtimeSessionConfig(env: TutorEnv): JsonBody {
     audio: {
       input: {
         turn_detection: {
-          type: "semantic_vad",
-          eagerness: "low",
+          type: "server_vad",
+          threshold: 0.75,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 700,
+          create_response: true,
+          interrupt_response: true,
         },
       },
       output: {
@@ -1502,6 +1506,71 @@ async function persistSessionEvents(
   sessionId: string,
   inputs: SessionEventInput[],
 ): Promise<SessionEventRecord[] | Response> {
+  const maxAttempts = 5;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const records = await prepareSessionEventRecords(db, sessionId, inputs);
+    if (records instanceof Response) {
+      return records;
+    }
+
+    try {
+      await db.batch(
+        records.map((record) =>
+          db.prepare(
+            `INSERT INTO tutor_session_events (
+              id,
+              session_id,
+              sequence,
+              event_type,
+              role,
+              modality,
+              content,
+              metadata_json,
+              client_created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).bind(
+            record.id,
+            record.sessionId,
+            record.sequence,
+            record.eventType,
+            record.role,
+            record.modality,
+            record.content,
+            record.metadataJson,
+            record.clientCreatedAt,
+          ),
+        ),
+      );
+
+      return records;
+    } catch (error) {
+      if (isSessionEventSequenceConflict(error)) {
+        if (attempt < maxAttempts) {
+          continue;
+        }
+
+        return jsonResponse(
+          {
+            error: "event_sequence_conflict",
+            message: "Could not store session events. Please try again.",
+          },
+          { status: 409 },
+        );
+      }
+
+      throw error;
+    }
+  }
+
+  throw new Error("Could not store session events.");
+}
+
+async function prepareSessionEventRecords(
+  db: D1Database,
+  sessionId: string,
+  inputs: SessionEventInput[],
+): Promise<SessionEventRecord[] | Response> {
   const nextSequence = await getNextEventSequence(db, sessionId);
   const records: SessionEventRecord[] = [];
 
@@ -1513,35 +1582,15 @@ async function persistSessionEvents(
     records.push(record);
   }
 
-  await db.batch(
-    records.map((record) =>
-      db.prepare(
-        `INSERT INTO tutor_session_events (
-          id,
-          session_id,
-          sequence,
-          event_type,
-          role,
-          modality,
-          content,
-          metadata_json,
-          client_created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(
-        record.id,
-        record.sessionId,
-        record.sequence,
-        record.eventType,
-        record.role,
-        record.modality,
-        record.content,
-        record.metadataJson,
-        record.clientCreatedAt,
-      ),
-    ),
-  );
-
   return records;
+}
+
+function isSessionEventSequenceConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("UNIQUE constraint failed: tutor_session_events.session_id, tutor_session_events.sequence") ||
+    message.includes("SQLITE_CONSTRAINT_UNIQUE")
+  );
 }
 
 function normalizeEventInputs(body: JsonBody): SessionEventInput[] | Response {
