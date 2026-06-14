@@ -14,6 +14,7 @@ import {
   type TutorBackendSession,
   type TutorAccess,
 } from './tutorBackend';
+import { setSpeakerOutputEnabled } from './audioRoute';
 import type {
   StartTutorRealtimeSessionInput,
   TutorRealtimeSession,
@@ -62,10 +63,12 @@ export async function startTutorRealtimeSession(
   let backendSession: TutorBackendSession | null = null;
 
   try {
+    await preferSpeakerOutput();
     localStream = await mediaDevices.getUserMedia({
       audio: true,
       video: false,
     });
+    await preferSpeakerOutput();
     const audioTracks = localStream.getAudioTracks();
 
     peerConnection = new RTCPeerConnection({ iceServers: [] });
@@ -83,6 +86,7 @@ export async function startTutorRealtimeSession(
     });
 
     listenToNativeEvent(peerConnection, 'track', () => {
+      void preferSpeakerOutput();
       input.onStatus('Tutor audio connected.');
     });
 
@@ -101,6 +105,7 @@ export async function startTutorRealtimeSession(
         sdp: backendSession.answerSdp,
       }),
     );
+    await preferSpeakerOutput();
 
     await waitForDataChannelOpen(dataChannel);
 
@@ -182,6 +187,7 @@ export async function startTutorRealtimeSession(
         stopMedia(activeLocalStream, audioTracks);
         activeDataChannel.close();
         activePeerConnection.close();
+        await restoreDefaultAudioRoute();
         await finishTutorSession({
           backendUrl: input.backendUrl,
           access: input.access,
@@ -197,6 +203,7 @@ export async function startTutorRealtimeSession(
     }
     dataChannel?.close();
     peerConnection?.close();
+    await restoreDefaultAudioRoute();
 
     if (backendSession) {
       await finishTutorSession({
@@ -259,10 +266,18 @@ function createTutorResponse(dataChannel: TutorDataChannel) {
     JSON.stringify({
       type: 'response.create',
       response: {
-        output_modalities: ['audio', 'text'],
+        output_modalities: ['audio'],
       },
     }),
   );
+}
+
+async function preferSpeakerOutput() {
+  await setSpeakerOutputEnabled(true).catch(() => undefined);
+}
+
+async function restoreDefaultAudioRoute() {
+  await setSpeakerOutputEnabled(false).catch(() => undefined);
 }
 
 function handleServerEvent(

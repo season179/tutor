@@ -7,6 +7,12 @@
     "icon": "./assets/icon.png",
     "plugins": [
       [
+        "expo-dev-client",
+        {
+          "toolsButton": false
+        }
+      ],
+      [
         "expo-camera",
         {
           "cameraPermission": "Allow tutor to use the camera to capture a temporary photo.",

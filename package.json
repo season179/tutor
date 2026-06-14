@@ -20,7 +20,8 @@
     "react-native-svg": "15.15.4",
     "react-native-web": "^0.21.2",
     "react-native-webrtc": "^124.0.7",
-    "react-native-webview": "13.16.1"
+    "react-native-webview": "13.16.1",
+    "tutor-audio-route": "file:./modules/tutor-audio-route"
   },
   "scripts": {
     "start": "expo start",

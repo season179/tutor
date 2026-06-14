@@ -603,10 +603,6 @@ export default function App() {
       <SafeAreaView style={styles.tutorScreen}>
         <StatusBar style="dark" />
         <View style={styles.tutorHeader}>
-          <View>
-            <Text style={styles.tutorTitle}>Tutor</Text>
-            <Text style={styles.tutorStatus}>{statusText}</Text>
-          </View>
           <Pressable
             accessibilityLabel="End session"
             disabled={isEndingTutor}
@@ -616,6 +612,10 @@ export default function App() {
             <LogOut color="#ffffff" size={18} strokeWidth={2.3} />
             <Text style={styles.endButtonText}>End</Text>
           </Pressable>
+          <View style={styles.tutorTitleBlock}>
+            <Text style={styles.tutorTitle}>Tutor</Text>
+            <Text style={styles.tutorStatus}>{statusText}</Text>
+          </View>
         </View>
 
         <ScrollView
@@ -978,9 +978,12 @@ const styles = StyleSheet.create({
     borderBottomColor: '#e5e7eb',
     borderBottomWidth: 1,
     flexDirection: 'row',
-    justifyContent: 'space-between',
+    gap: 14,
     paddingHorizontal: 18,
     paddingVertical: 14,
+  },
+  tutorTitleBlock: {
+    flex: 1,
   },
   tutorTitle: {
     color: '#111827',
