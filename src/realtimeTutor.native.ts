@@ -1,0 +1,407 @@
+import { File } from 'expo-file-system';
+import {
+  mediaDevices,
+  RTCPeerConnection,
+  RTCSessionDescription,
+  type MediaStream,
+  type MediaStreamTrack,
+} from 'react-native-webrtc';
+import {
+  appendTutorEvents,
+  createBackendRealtimeSession,
+  finishTutorSession,
+  uploadSessionPhoto,
+  type TutorBackendSession,
+  type TutorAccess,
+} from './tutorBackend';
+import type {
+  StartTutorRealtimeSessionInput,
+  TutorRealtimeSession,
+  TutorTranscriptEntry,
+} from './realtimeTutor';
+
+type RealtimeServerEvent = {
+  type?: string;
+  delta?: string;
+  text?: string;
+  transcript?: string;
+  response?: {
+    status?: string;
+    output?: Array<{
+      content?: Array<{
+        type?: string;
+        text?: string;
+        transcript?: string;
+      }>;
+    }>;
+  };
+  error?: {
+    message?: string;
+  };
+};
+
+type TutorDataChannel = ReturnType<RTCPeerConnection['createDataChannel']>;
+
+type NativeEventTarget<TEvent> = {
+  addEventListener?: (type: string, listener: (event: TEvent) => void) => void;
+};
+
+type RealtimeEventContext = {
+  access: TutorAccess;
+  backendUrl: string;
+  getSessionId: () => string | null;
+};
+
+export async function startTutorRealtimeSession(
+  input: StartTutorRealtimeSessionInput,
+): Promise<TutorRealtimeSession> {
+  input.onStatus('Opening microphone...');
+  let localStream: MediaStream | null = null;
+  let peerConnection: RTCPeerConnection | null = null;
+  let dataChannel: TutorDataChannel | null = null;
+  let backendSession: TutorBackendSession | null = null;
+
+  try {
+    localStream = await mediaDevices.getUserMedia({
+      audio: true,
+      video: false,
+    });
+    const audioTracks = localStream.getAudioTracks();
+
+    peerConnection = new RTCPeerConnection({ iceServers: [] });
+    for (const track of audioTracks) {
+      peerConnection.addTrack(track, localStream);
+    }
+
+    dataChannel = peerConnection.createDataChannel('oai-events');
+    listenToNativeEvent(dataChannel, 'message', (event: { data: unknown }) => {
+      handleServerEvent(String(event.data), input, {
+        access: input.access,
+        backendUrl: input.backendUrl,
+        getSessionId: () => backendSession?.sessionId || null,
+      });
+    });
+
+    listenToNativeEvent(peerConnection, 'track', () => {
+      input.onStatus('Tutor audio connected.');
+    });
+
+    input.onStatus('Creating realtime session...');
+    const offer = await peerConnection.createOffer();
+    await peerConnection.setLocalDescription(offer);
+    backendSession = await createBackendRealtimeSession({
+      backendUrl: input.backendUrl,
+      access: input.access,
+      offerSdp: offer.sdp,
+    });
+
+    await peerConnection.setRemoteDescription(
+      new RTCSessionDescription({
+        type: 'answer',
+        sdp: backendSession.answerSdp,
+      }),
+    );
+
+    await waitForDataChannelOpen(dataChannel);
+
+    input.onStatus('Uploading question photo...');
+    const [photoUpload, base64Image] = await Promise.all([
+      uploadSessionPhoto({
+        backendUrl: input.backendUrl,
+        access: input.access,
+        sessionId: backendSession.sessionId,
+        photoUri: input.photoUri,
+        contentType: input.photoContentType,
+      }),
+      new File(input.photoUri).base64(),
+    ]);
+
+    sendQuestionImage(dataChannel, input.photoContentType, base64Image);
+    input.onTranscript({
+      id: `student-photo-${Date.now()}`,
+      role: 'student',
+      text: 'I sent a photo of the question.',
+    });
+    void appendTutorEvents({
+      backendUrl: input.backendUrl,
+      access: input.access,
+      sessionId: backendSession.sessionId,
+      events: [
+        {
+          eventType: 'question_photo_sent',
+          role: 'student',
+          modality: 'image',
+          content: photoUpload.r2Key,
+          metadata: { r2Key: photoUpload.r2Key },
+          clientCreatedAt: new Date().toISOString(),
+        },
+      ],
+    }).catch(() => undefined);
+
+    input.onStatus('Tutor is thinking...');
+    if (!backendSession || !dataChannel || !peerConnection || !localStream) {
+      throw new Error('Realtime tutoring session did not finish initializing.');
+    }
+
+    const activeBackendSession = backendSession;
+    const activeDataChannel = dataChannel;
+    const activePeerConnection = peerConnection;
+    const activeLocalStream = localStream;
+
+    return {
+      sessionId: activeBackendSession.sessionId,
+      photoR2Key: photoUpload.r2Key,
+      sendText: (text) => {
+        sendTextMessage(activeDataChannel, text);
+        input.onTranscript({
+          id: `student-text-${Date.now()}`,
+          role: 'student',
+          text,
+        });
+        void appendTutorEvents({
+          backendUrl: input.backendUrl,
+          access: input.access,
+          sessionId: activeBackendSession.sessionId,
+          events: [
+            {
+              eventType: 'student_text_followup',
+              role: 'student',
+              modality: 'text',
+              content: text,
+              clientCreatedAt: new Date().toISOString(),
+            },
+          ],
+        }).catch(() => undefined);
+      },
+      setMuted: (muted) => {
+        for (const track of audioTracks) {
+          track.enabled = !muted;
+        }
+      },
+      end: async (status = 'ended', errorSummary) => {
+        stopMedia(activeLocalStream, audioTracks);
+        activeDataChannel.close();
+        activePeerConnection.close();
+        await finishTutorSession({
+          backendUrl: input.backendUrl,
+          access: input.access,
+          sessionId: activeBackendSession.sessionId,
+          status,
+          errorSummary,
+        });
+      },
+    };
+  } catch (error) {
+    if (localStream) {
+      stopMedia(localStream, localStream.getAudioTracks());
+    }
+    dataChannel?.close();
+    peerConnection?.close();
+
+    if (backendSession) {
+      await finishTutorSession({
+        backendUrl: input.backendUrl,
+        access: input.access,
+        sessionId: backendSession.sessionId,
+        status: 'failed',
+        errorSummary: messageFromUnknown(error),
+      }).catch(() => undefined);
+    }
+
+    throw error;
+  }
+}
+
+function sendQuestionImage(dataChannel: TutorDataChannel, contentType: string, base64Image: string) {
+  dataChannel.send(
+    JSON.stringify({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'Please help me solve this question. Guide me step by step and ask one small question at a time.',
+          },
+          {
+            type: 'input_image',
+            image_url: `data:${contentType};base64,${base64Image}`,
+          },
+        ],
+      },
+    }),
+  );
+  createTutorResponse(dataChannel);
+}
+
+function sendTextMessage(dataChannel: TutorDataChannel, text: string) {
+  dataChannel.send(
+    JSON.stringify({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text,
+          },
+        ],
+      },
+    }),
+  );
+  createTutorResponse(dataChannel);
+}
+
+function createTutorResponse(dataChannel: TutorDataChannel) {
+  dataChannel.send(
+    JSON.stringify({
+      type: 'response.create',
+      response: {
+        output_modalities: ['audio', 'text'],
+      },
+    }),
+  );
+}
+
+function handleServerEvent(
+  rawData: string,
+  input: StartTutorRealtimeSessionInput,
+  context: RealtimeEventContext,
+) {
+  let event: RealtimeServerEvent;
+  try {
+    event = JSON.parse(rawData) as RealtimeServerEvent;
+  } catch {
+    return;
+  }
+
+  switch (event.type) {
+    case 'session.created':
+      input.onStatus('Tutor connected.');
+      break;
+    case 'input_audio_buffer.speech_started':
+      input.onStatus('Listening...');
+      break;
+    case 'input_audio_buffer.speech_stopped':
+      input.onStatus('Tutor is thinking...');
+      break;
+    case 'response.output_text.delta':
+    case 'response.output_audio_transcript.delta':
+      if (event.delta) {
+        input.onAssistantDelta(event.delta);
+      }
+      break;
+    case 'response.output_text.done':
+    case 'response.output_audio_transcript.done':
+      {
+        const text = event.transcript || event.text || extractResponseText(event);
+        if (text) {
+          input.onTranscript(assistantEntry(text));
+          logAssistantTranscript(context, event.type, text);
+        }
+      }
+      input.onStatus('Listening...');
+      break;
+    case 'response.done':
+      input.onStatus('Listening...');
+      break;
+    case 'error':
+      input.onError(event.error?.message || 'Realtime session error.');
+      break;
+  }
+}
+
+function logAssistantTranscript(
+  context: RealtimeEventContext,
+  eventType: string,
+  text: string,
+) {
+  const sessionId = context.getSessionId();
+  if (!sessionId) {
+    return;
+  }
+
+  void appendTutorEvents({
+    backendUrl: context.backendUrl,
+    access: context.access,
+    sessionId,
+    events: [
+      {
+        eventType,
+        role: 'assistant',
+        modality: eventType.includes('audio') ? 'audio_transcript' : 'text',
+        content: text,
+        clientCreatedAt: new Date().toISOString(),
+      },
+    ],
+  }).catch(() => undefined);
+}
+
+function assistantEntry(text: string): TutorTranscriptEntry {
+  return {
+    id: `assistant-${Date.now()}`,
+    role: 'assistant',
+    text,
+  };
+}
+
+function waitForDataChannelOpen(dataChannel: TutorDataChannel): Promise<void> {
+  if (dataChannel.readyState === 'open') {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Realtime data channel did not open.')), 15_000);
+
+    listenToNativeEvent(dataChannel, 'open', () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+
+    listenToNativeEvent(dataChannel, 'error', () => {
+      clearTimeout(timeout);
+      reject(new Error('Realtime data channel failed to open.'));
+    });
+  });
+}
+
+function listenToNativeEvent<TEvent>(
+  target: object,
+  type: string,
+  listener: (event: TEvent) => void,
+) {
+  const eventTarget = target as NativeEventTarget<TEvent>;
+  if (eventTarget.addEventListener) {
+    eventTarget.addEventListener(type, listener);
+    return;
+  }
+
+  (target as Record<string, unknown>)[`on${type}`] = listener;
+}
+
+function extractResponseText(event: RealtimeServerEvent): string | null {
+  const content = event.response?.output?.flatMap((output) => output.content || []) || [];
+  const textParts = content
+    .map((part) => part.transcript || part.text)
+    .filter((part): part is string => Boolean(part));
+
+  return textParts.length > 0 ? textParts.join('') : null;
+}
+
+function messageFromUnknown(error: unknown): string {
+  return error instanceof Error ? error.message : 'Unknown realtime tutoring error.';
+}
+
+function stopMedia(localStream: MediaStream, audioTracks: MediaStreamTrack[]) {
+  for (const track of audioTracks) {
+    track.stop();
+  }
+
+  for (const track of localStream.getTracks()) {
+    if (!audioTracks.includes(track)) {
+      track.stop();
+    }
+  }
+}

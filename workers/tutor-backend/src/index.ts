@@ -807,10 +807,16 @@ function realtimeSessionConfig(env: TutorEnv): JsonBody {
     type: "realtime",
     model: env.OPENAI_REALTIME_MODEL || DEFAULT_MODEL,
     instructions: TUTOR_INSTRUCTIONS,
+    output_modalities: ["audio", "text"],
     reasoning: {
       effort: "low",
     },
     audio: {
+      input: {
+        turn_detection: {
+          type: "semantic_vad",
+        },
+      },
       output: {
         voice: env.OPENAI_REALTIME_VOICE || DEFAULT_VOICE,
       },
