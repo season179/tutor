@@ -1,4 +1,4 @@
-import { File } from 'expo-file-system';
+import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
 import {
   mediaDevices,
   RTCPeerConnection,
@@ -21,6 +21,10 @@ import type {
   TutorTranscriptEntry,
 } from './realtimeTutor';
 
+const REALTIME_IMAGE_CONTENT_TYPE = 'image/jpeg';
+const REALTIME_IMAGE_MAX_EDGE = 1400;
+const REALTIME_IMAGE_COMPRESSION = 0.72;
+
 type RealtimeServerEvent = {
   type?: string;
   delta?: string;
@@ -42,6 +46,14 @@ type RealtimeServerEvent = {
 };
 
 type TutorDataChannel = ReturnType<RTCPeerConnection['createDataChannel']>;
+
+type PreparedRealtimeImage = {
+  base64: string;
+  contentType: typeof REALTIME_IMAGE_CONTENT_TYPE;
+  width: number;
+  height: number;
+  byteLength: number;
+};
 
 type NativeEventTarget<TEvent> = {
   addEventListener?: (type: string, listener: (event: TEvent) => void) => void;
@@ -109,8 +121,8 @@ export async function startTutorRealtimeSession(
 
     await waitForDataChannelOpen(dataChannel);
 
-    input.onStatus('Uploading question photo...');
-    const [photoUpload, base64Image] = await Promise.all([
+    input.onStatus('Preparing question photo...');
+    const [photoUpload, realtimeImage] = await Promise.all([
       uploadSessionPhoto({
         backendUrl: input.backendUrl,
         access: input.access,
@@ -118,10 +130,10 @@ export async function startTutorRealtimeSession(
         photoUri: input.photoUri,
         contentType: input.photoContentType,
       }),
-      new File(input.photoUri).base64(),
+      prepareRealtimeImage(input),
     ]);
 
-    sendQuestionImage(dataChannel, input.photoContentType, base64Image);
+    sendQuestionImage(dataChannel, realtimeImage);
     input.onTranscript({
       id: `student-photo-${Date.now()}`,
       role: 'student',
@@ -137,7 +149,14 @@ export async function startTutorRealtimeSession(
           role: 'student',
           modality: 'image',
           content: photoUpload.r2Key,
-          metadata: { r2Key: photoUpload.r2Key },
+          metadata: {
+            r2Key: photoUpload.r2Key,
+            originalContentType: input.photoContentType,
+            realtimeContentType: realtimeImage.contentType,
+            realtimeWidth: realtimeImage.width,
+            realtimeHeight: realtimeImage.height,
+            realtimeByteLength: realtimeImage.byteLength,
+          },
           clientCreatedAt: new Date().toISOString(),
         },
       ],
@@ -219,7 +238,54 @@ export async function startTutorRealtimeSession(
   }
 }
 
-function sendQuestionImage(dataChannel: TutorDataChannel, contentType: string, base64Image: string) {
+async function prepareRealtimeImage(
+  input: StartTutorRealtimeSessionInput,
+): Promise<PreparedRealtimeImage> {
+  const context = ImageManipulator.manipulate(input.photoUri);
+  const resize = realtimeImageResize(input.photoWidth, input.photoHeight);
+  if (resize.width || resize.height) {
+    context.resize(resize);
+  }
+
+  const rendered = await context.renderAsync();
+  const result = await rendered.saveAsync({
+    base64: true,
+    compress: REALTIME_IMAGE_COMPRESSION,
+    format: SaveFormat.JPEG,
+  });
+
+  if (!result.base64) {
+    throw new Error('Could not prepare the question photo for realtime tutoring.');
+  }
+
+  return {
+    base64: result.base64,
+    contentType: REALTIME_IMAGE_CONTENT_TYPE,
+    width: result.width,
+    height: result.height,
+    byteLength: base64ByteLength(result.base64),
+  };
+}
+
+function realtimeImageResize(width: number, height: number): { width?: number; height?: number } {
+  if (!width || !height) {
+    return { width: REALTIME_IMAGE_MAX_EDGE };
+  }
+
+  const maxEdge = Math.max(width, height);
+  if (maxEdge <= REALTIME_IMAGE_MAX_EDGE) {
+    return {};
+  }
+
+  return width >= height ? { width: REALTIME_IMAGE_MAX_EDGE } : { height: REALTIME_IMAGE_MAX_EDGE };
+}
+
+function base64ByteLength(base64: string): number {
+  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+  return Math.floor((base64.length * 3) / 4) - padding;
+}
+
+function sendQuestionImage(dataChannel: TutorDataChannel, image: PreparedRealtimeImage) {
   dataChannel.send(
     JSON.stringify({
       type: 'conversation.item.create',
@@ -229,11 +295,12 @@ function sendQuestionImage(dataChannel: TutorDataChannel, contentType: string, b
         content: [
           {
             type: 'input_text',
-            text: 'Please help me solve this question. Guide me step by step and ask one small question at a time.',
+            text: 'Please read this question photo and help me solve it. Guide me step by step and ask one small question at a time.',
           },
           {
             type: 'input_image',
-            image_url: `data:${contentType};base64,${base64Image}`,
+            image_url: `data:${image.contentType};base64,${image.base64}`,
+            detail: 'high',
           },
         ],
       },

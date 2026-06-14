@@ -19,6 +19,8 @@ export type StartTutorRealtimeSessionInput = {
   access: TutorAccess;
   photoUri: string;
   photoContentType: string;
+  photoWidth: number;
+  photoHeight: number;
   onStatus: (status: string) => void;
   onTranscript: (entry: TutorTranscriptEntry) => void;
   onAssistantDelta: (delta: string) => void;

@@ -36,7 +36,7 @@ import {
 import { extractAccessCookie, type TutorAccess } from './src/tutorBackend';
 import { runNativeWebRTCSmokeTest } from './src/webrtcSmoke';
 
-type Screen = 'home' | 'source' | 'camera' | 'preview' | 'auth' | 'tutor';
+type Screen = 'source' | 'camera' | 'preview' | 'auth' | 'tutor';
 type CapturedPhoto = {
   uri: string;
   width: number;
@@ -100,7 +100,7 @@ export default function App() {
   const tutorSessionRef = useRef<TutorRealtimeSession | null>(null);
   const accessStartRef = useRef(false);
   const [permission, requestPermission] = useCameraPermissions();
-  const [screen, setScreen] = useState<Screen>('home');
+  const [screen, setScreen] = useState<Screen>('source');
   const [photo, setPhoto] = useState<CapturedPhoto | null>(null);
   const [access, setAccess] = useState<TutorAccess | null>(null);
   const [tutorSession, setTutorSession] = useState<TutorRealtimeSession | null>(null);
@@ -182,11 +182,6 @@ export default function App() {
     setAssistantDraft('');
   }
 
-  function openPhotoSource() {
-    setErrorMessage(null);
-    setScreen('source');
-  }
-
   async function openCamera() {
     setErrorMessage(null);
     setHasCameraPreviewTimedOut(false);
@@ -224,7 +219,7 @@ export default function App() {
     setIsEndingTutor(false);
     setStatusText('Ready');
     setErrorMessage(null);
-    setScreen('home');
+    setScreen('source');
   }
 
   async function takePhoto() {
@@ -336,6 +331,8 @@ export default function App() {
         access: nextAccess,
         photoUri: photo.uri,
         photoContentType: photoContentType(photo),
+        photoWidth: photo.width,
+        photoHeight: photo.height,
         onStatus: setStatusText,
         onTranscript: appendTranscript,
         onAssistantDelta: (delta) => {
@@ -416,16 +413,6 @@ export default function App() {
     return (
       <SafeAreaView style={styles.sourceScreen}>
         <StatusBar style="dark" />
-        <View style={styles.sourceHeader}>
-          <Pressable
-            accessibilityLabel="Back"
-            hitSlop={12}
-            onPress={returnHome}
-            style={styles.lightIconButton}
-          >
-            <ArrowLeft color="#111827" size={25} strokeWidth={2.3} />
-          </Pressable>
-        </View>
         <View style={styles.sourceContent}>
           <Text style={styles.sourceTitle}>Question photo</Text>
           <View style={styles.sourceActions}>
@@ -537,7 +524,7 @@ export default function App() {
           <Pressable
             accessibilityLabel="Back"
             hitSlop={12}
-            onPress={() => setScreen(photo ? 'preview' : 'home')}
+            onPress={() => setScreen(photo ? 'preview' : 'source')}
             style={styles.lightIconButton}
           >
             <ArrowLeft color="#111827" size={25} strokeWidth={2.3} />
@@ -689,53 +676,13 @@ export default function App() {
     );
   }
 
-  return (
-    <View style={styles.container}>
-      <Text style={styles.title}>Hi!</Text>
-      <Pressable onPress={openPhotoSource} style={styles.captureButton}>
-        <Camera color="#ffffff" size={22} strokeWidth={2.4} />
-        <Text style={styles.captureButtonText}>Capture</Text>
-      </Pressable>
-      <StatusBar style="auto" />
-    </View>
-  );
+  return null;
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    alignItems: 'center',
-    backgroundColor: '#fff',
-    justifyContent: 'center',
-    padding: 24,
-  },
-  title: {
-    color: '#111827',
-    fontSize: 42,
-    fontWeight: '700',
-    marginBottom: 28,
-    textAlign: 'center',
-  },
-  captureButton: {
-    alignItems: 'center',
-    backgroundColor: '#111827',
-    borderRadius: 8,
-    flexDirection: 'row',
-    gap: 10,
-    minHeight: 52,
-    paddingHorizontal: 22,
-  },
-  captureButtonText: {
-    color: '#ffffff',
-    fontSize: 17,
-    fontWeight: '700',
-  },
   sourceScreen: {
     backgroundColor: '#ffffff',
     flex: 1,
-  },
-  sourceHeader: {
-    padding: 18,
   },
   sourceContent: {
     flex: 1,

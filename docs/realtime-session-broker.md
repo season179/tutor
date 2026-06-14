@@ -47,7 +47,7 @@ The Expo app uses the Cloudflare Access-protected Worker as the only route to Op
 2. If the app does not have a Cloudflare Access cookie yet, it opens `GET /debug` in an in-app WebView so the family member can complete the one-time PIN flow.
 3. The app reads the `CF_Authorization` cookie from the WebView and sends it as the `Cookie` header on native fetches. Cloudflare Access validates that cookie at the edge and injects `Cf-Access-Jwt-Assertion` before the Worker runs.
 4. The app creates a native WebRTC offer and posts it to `POST /session`.
-5. After the Realtime data channel opens, the app uploads the captured photo to R2 and also sends the photo bytes to `gpt-realtime-2` as an `input_image` conversation item.
+5. After the Realtime data channel opens, the app uploads the original captured photo to R2 and sends a resized JPEG preview to `gpt-realtime-2` as an `input_image` conversation item.
 6. The app requests audio output, streams microphone audio over WebRTC, plays model audio via the native WebRTC track, and renders text/transcript events in the tutor screen.
 7. On end, cancel, or failed startup, the app closes the peer connection, stops microphone tracks, finishes the D1 session, and deletes the local temporary photo.
 
