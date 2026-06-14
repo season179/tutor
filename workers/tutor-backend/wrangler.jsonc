@@ -18,6 +18,12 @@
       "migrations_dir": "migrations"
     }
   ],
+  "r2_buckets": [
+    {
+      "binding": "TUTOR_PHOTOS",
+      "bucket_name": "tutor-question-photos"
+    }
+  ],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
