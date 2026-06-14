@@ -12,6 +12,7 @@ import {
   Text,
   View,
 } from 'react-native';
+import { runNativeWebRTCSmokeTest } from './src/webrtcSmoke';
 
 type Screen = 'home' | 'camera' | 'preview';
 type CapturedPhoto = {
@@ -47,6 +48,33 @@ export default function App() {
   useEffect(() => {
     return () => deleteTemporaryPhoto(photo?.uri);
   }, [photo?.uri]);
+
+  useEffect(() => {
+    if (!__DEV__ || Platform.OS === 'web') {
+      return;
+    }
+
+    let isMounted = true;
+
+    void runNativeWebRTCSmokeTest().then((result) => {
+      if (!isMounted) {
+        return;
+      }
+
+      const log = result.ok ? console.info : console.warn;
+      log(
+        JSON.stringify({
+          service: 'tutor-app',
+          event: 'webrtc_peer_connection_smoke',
+          ...result,
+        }),
+      );
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   async function openCamera() {
     setErrorMessage(null);

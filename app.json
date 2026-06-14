@@ -12,6 +12,13 @@
           "cameraPermission": "Allow tutor to use the camera to capture a temporary photo.",
           "recordAudioAndroid": false
         }
+      ],
+      [
+        "@config-plugins/react-native-webrtc",
+        {
+          "cameraPermission": "Allow tutor to use the camera for photographed questions and tutor sessions.",
+          "microphonePermission": "Allow tutor to use the microphone for voice tutoring."
+        }
       ]
     ],
     "userInterfaceStyle": "light",
