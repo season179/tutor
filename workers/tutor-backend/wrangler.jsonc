@@ -1,0 +1,23 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "tutor-backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-13",
+  "compatibility_flags": ["nodejs_compat"],
+  "routes": [
+    {
+      "pattern": "tutor.digitalvanguard.xyz",
+      "custom_domain": true
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "ALLOWED_ORIGINS": "http://localhost:8081,http://localhost:19006,http://127.0.0.1:8081,http://127.0.0.1:19006",
+    "CLOUDFLARE_ACCESS_TEAM_DOMAIN": "https://season-internal.cloudflareaccess.com",
+    "OPENAI_REALTIME_MODEL": "gpt-realtime-2",
+    "OPENAI_REALTIME_VOICE": "marin"
+  }
+}

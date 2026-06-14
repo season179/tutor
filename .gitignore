@@ -6,6 +6,7 @@ node_modules/
 
 # Expo
 .expo/
+.wrangler/
 dist/
 web-build/
 expo-env.d.ts
@@ -33,6 +34,16 @@ yarn-error.*
 
 # local env files
 .env*.local
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
 
 # typescript
 *.tsbuildinfo
